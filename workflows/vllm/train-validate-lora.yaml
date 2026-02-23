@@ -1,0 +1,200 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: train-lora-
+  namespace: ml-models
+  labels:
+    workflows.argoproj.io/workflow-type: training
+    model: mistral-7b-lora
+spec:
+  serviceAccountName: workflow-sa
+
+  entrypoint: training-pipeline
+
+  arguments:
+    parameters:
+    - name: data-version
+      value: "1"
+
+    - name: lora-config
+      value: "standard"
+
+    - name: mlflow-tracking-uri
+      value: "http://mlflow.ai-platform:80"
+
+    - name: s3-data-bucket
+      value: "s3://my-vllm-data"
+
+    # Training hyperparameter overrides (empty = use config.py defaults)
+    - name: learning-rate
+      value: ""
+
+    - name: num-epochs
+      value: ""
+
+    - name: batch-size
+      value: ""
+
+    - name: max-seq-length
+      value: ""
+
+    # Quality gate threshold overrides (empty = use config.py defaults)
+    - name: max-eval-loss
+      value: ""
+
+    - name: max-perplexity
+      value: ""
+
+  templates:
+  - name: training-pipeline
+    steps:
+    # Step 1: Download training data from S3
+    - - name: download-data
+        template: download-data-step
+
+    # Step 2: Train LoRA adapter (GPU)
+    - - name: train
+        template: train-step
+        arguments:
+          artifacts:
+          - name: training-data
+            from: "{{steps.download-data.outputs.artifacts.training-data}}"
+
+    # Step 3: Quality Gate — check metrics, register as 'candidate' if passed
+    - - name: quality-gate
+        template: quality-gate-step
+        arguments:
+          parameters:
+          - name: run-id
+            value: "{{steps.train.outputs.parameters.run-id}}"
+
+  # Step Template Definitions
+
+  - name: download-data-step
+    outputs:
+      artifacts:
+      - name: training-data
+        path: /data
+    container:
+      image: amazon/aws-cli:latest
+      command: [sh, -c]
+      args:
+      - |
+        echo "Downloading data version {{workflow.parameters.data-version}}..."
+        aws s3 sync \
+          {{workflow.parameters.s3-data-bucket}}/data/processed/{{workflow.parameters.data-version}}/ \
+          /data/
+        echo "Files downloaded:"
+        ls -lh /data/
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "250m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+
+  - name: train-step
+    inputs:
+      artifacts:
+      - name: training-data
+        path: /data
+    outputs:
+      parameters:
+      - name: run-id
+        valueFrom:
+          path: /tmp/mlflow_run_id
+    nodeSelector:
+      workload: gpu-training
+    tolerations:
+    - key: nvidia.com/gpu
+      value: "true"
+      effect: NoSchedule
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/vllm-training-tools:latest
+      imagePullPolicy: Always
+      command: [sh, -c]
+      args:
+      - |
+        ARGS="--train-file=/data/train.jsonl --val-file=/data/val.jsonl"
+        ARGS="$ARGS --data-version={{workflow.parameters.data-version}}"
+        ARGS="$ARGS --lora-config={{workflow.parameters.lora-config}}"
+        ARGS="$ARGS --log-adapter-to-mlflow"
+        if [ -n "{{workflow.parameters.learning-rate}}" ]; then
+          ARGS="$ARGS --learning-rate={{workflow.parameters.learning-rate}}"
+        fi
+        if [ -n "{{workflow.parameters.num-epochs}}" ]; then
+          ARGS="$ARGS --num-epochs={{workflow.parameters.num-epochs}}"
+        fi
+        if [ -n "{{workflow.parameters.batch-size}}" ]; then
+          ARGS="$ARGS --batch-size={{workflow.parameters.batch-size}}"
+        fi
+        if [ -n "{{workflow.parameters.max-seq-length}}" ]; then
+          ARGS="$ARGS --max-seq-length={{workflow.parameters.max-seq-length}}"
+        fi
+        python /scripts/lora/train_lora.py $ARGS
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: MLFLOW_TRACKING_URI
+        value: "{{workflow.parameters.mlflow-tracking-uri}}"
+      - name: DATA_SOURCE
+        value: "{{workflow.parameters.s3-data-bucket}}/data/processed/{{workflow.parameters.data-version}}"
+      - name: HF_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: hf-token
+            key: token
+      resources:
+        requests:
+          nvidia.com/gpu: 1
+          cpu: "3"
+          memory: "12Gi"
+        limits:
+          nvidia.com/gpu: 1
+          cpu: "4"
+          memory: "14Gi"
+      volumeMounts:
+      - name: dshm
+        mountPath: /dev/shm
+    volumes:
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 4Gi
+
+  - name: quality-gate-step
+    inputs:
+      parameters:
+      - name: run-id
+    outputs:
+      parameters:
+      - name: result
+        valueFrom:
+          path: /tmp/quality_gate_result
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/vllm-training-tools:latest
+      imagePullPolicy: Always
+      command: [sh, -c]
+      args:
+      - |
+        ARGS="--run-id={{inputs.parameters.run-id}}"
+        if [ -n "{{workflow.parameters.max-eval-loss}}" ]; then
+          ARGS="$ARGS --max-eval-loss={{workflow.parameters.max-eval-loss}}"
+        fi
+        if [ -n "{{workflow.parameters.max-perplexity}}" ]; then
+          ARGS="$ARGS --max-perplexity={{workflow.parameters.max-perplexity}}"
+        fi
+        python /scripts/lora/quality_gate.py $ARGS
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: MLFLOW_TRACKING_URI
+        value: "{{workflow.parameters.mlflow-tracking-uri}}"
+      resources:
+        requests:
+          memory: "512Mi"
+          cpu: "250m"
+        limits:
+          memory: "1Gi"
+          cpu: "500m"

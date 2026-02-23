@@ -1,0 +1,257 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: perf-test-lora-
+  namespace: ml-models
+  labels:
+    workflows.argoproj.io/workflow-type: performance
+    model: mistral-7b-lora
+spec:
+  serviceAccountName: workflow-sa
+
+  entrypoint: performance-pipeline
+
+  arguments:
+    parameters:
+    - name: model-name
+      value: "mistral-7b-lora"
+
+    - name: candidate-adapter
+      value: "aws-rag-qa-candidate"
+
+    - name: vllm-url
+      value: "http://vllm-service.ml-models:8000"
+
+    - name: mlflow-tracking-uri
+      value: "http://mlflow.ai-platform:80"
+
+    - name: s3-data-bucket
+      value: "s3://my-vllm-data"
+
+    - name: prometheus-url
+      value: "http://monitoring-kube-prometheus-prometheus.ai-platform:9090"
+
+    - name: concurrency
+      value: "10"
+
+    - name: max-tokens
+      value: "256"
+
+    - name: max-samples
+      value: "0"
+
+    - name: max-p95-latency
+      value: "8.0"
+
+    - name: max-p95-ttft
+      value: "2.0"
+
+    - name: min-throughput
+      value: "2.0"
+
+    - name: min-success-rate
+      value: "0.99"
+
+    - name: latency-regression-factor
+      value: "1.15"
+
+    - name: throughput-regression-factor
+      value: "0.85"
+
+    - name: mlflow-experiment
+      value: "vllm-lora-performance"
+
+  templates:
+  - name: performance-pipeline
+    steps:
+    # Step 1: Download evaluation data from S3
+    - - name: download-eval-data
+        template: download-eval-data-step
+
+    # Step 2: Run load test against candidate adapter
+    - - name: run-load-test
+        template: load-test-step
+        arguments:
+          artifacts:
+          - name: eval-data
+            from: "{{steps.download-eval-data.outputs.artifacts.eval-data}}"
+
+    # Step 3: Evaluate performance and set gate decision
+    - - name: perf-decision
+        template: perf-decision-step
+        arguments:
+          parameters:
+          - name: data-source
+            value: "{{workflow.parameters.s3-data-bucket}}/data/processed/{{steps.download-eval-data.outputs.parameters.data-version}}/eval.jsonl"
+          artifacts:
+          - name: load-test-results
+            from: "{{steps.run-load-test.outputs.artifacts.load-test-results}}"
+          - name: eval-data
+            from: "{{steps.download-eval-data.outputs.artifacts.eval-data}}"
+
+  # Step Template Definitions
+
+  - name: download-eval-data-step
+    outputs:
+      artifacts:
+      - name: eval-data
+        path: /data/eval.jsonl
+      parameters:
+      - name: data-version
+        valueFrom:
+          path: /data/data_version.txt
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/vllm-deployment-tools:latest
+      imagePullPolicy: Always
+      command: [sh, -c]
+      args:
+      - |
+        echo "Resolving data version from MLflow..."
+
+        # Query MLflow for the eval-passed adapter's data.version tag
+        DATA_VERSION=$(python3 -c "
+        import mlflow
+        from mlflow.tracking import MlflowClient
+        client = MlflowClient()
+        mv = client.get_model_version_by_alias('{{workflow.parameters.model-name}}', 'eval-passed')
+        run = client.get_run(mv.run_id)
+        print(run.data.tags.get('data.version', ''))
+        ")
+
+        if [ -z "$DATA_VERSION" ]; then
+          echo "ERROR: Could not resolve data.version from MLflow"
+          exit 1
+        fi
+
+        echo "Data version: $DATA_VERSION"
+        echo -n "$DATA_VERSION" > /data/data_version.txt
+
+        echo "Downloading evaluation data..."
+        aws s3 cp {{workflow.parameters.s3-data-bucket}}/data/processed/${DATA_VERSION}/eval.jsonl /data/eval.jsonl
+        echo "Download complete"
+        wc -l /data/eval.jsonl
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: MLFLOW_TRACKING_URI
+        value: "{{workflow.parameters.mlflow-tracking-uri}}"
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "250m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+      volumeMounts:
+      - name: data
+        mountPath: /data
+    volumes:
+    - name: data
+      emptyDir: {}
+
+  - name: load-test-step
+    inputs:
+      artifacts:
+      - name: eval-data
+        path: /data/eval.jsonl
+    outputs:
+      artifacts:
+      - name: load-test-results
+        path: /output/load_test_results.json
+      parameters:
+      - name: status
+        valueFrom:
+          path: /output/load_test_status.txt
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/vllm-deployment-tools:latest
+      imagePullPolicy: Always
+      command: [python, /perf-scripts/steps/run_load_test.py]
+      args:
+      - --vllm-url={{workflow.parameters.vllm-url}}
+      - --adapter-name={{workflow.parameters.candidate-adapter}}
+      - --eval-data-path=/data/eval.jsonl
+      - --max-tokens={{workflow.parameters.max-tokens}}
+      - --temperature=0.0
+      - --concurrency={{workflow.parameters.concurrency}}
+      - --max-samples={{workflow.parameters.max-samples}}
+      - --prometheus-url={{workflow.parameters.prometheus-url}}
+      - --output-dir=/output
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      resources:
+        requests:
+          memory: "512Mi"
+          cpu: "500m"
+        limits:
+          memory: "1Gi"
+          cpu: "1000m"
+      volumeMounts:
+      - name: data
+        mountPath: /data
+      - name: output
+        mountPath: /output
+    volumes:
+    - name: data
+      emptyDir: {}
+    - name: output
+      emptyDir: {}
+
+  - name: perf-decision-step
+    inputs:
+      parameters:
+      - name: data-source
+      artifacts:
+      - name: load-test-results
+        path: /input/load_test_results.json
+      - name: eval-data
+        path: /input/eval.jsonl
+        optional: true
+    outputs:
+      artifacts:
+      - name: perf-decision
+        path: /output/perf_decision.json
+      parameters:
+      - name: status
+        valueFrom:
+          path: /output/perf_status.txt
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/vllm-deployment-tools:latest
+      imagePullPolicy: Always
+      command: [python, /perf-scripts/steps/perf_decision.py]
+      args:
+      - --load-test-results=/input/load_test_results.json
+      - --model-name={{workflow.parameters.model-name}}
+      - --candidate-source=alias:eval-passed
+      - --max-p95-latency={{workflow.parameters.max-p95-latency}}
+      - --max-p95-ttft={{workflow.parameters.max-p95-ttft}}
+      - --min-throughput={{workflow.parameters.min-throughput}}
+      - --min-success-rate={{workflow.parameters.min-success-rate}}
+      - --latency-regression-factor={{workflow.parameters.latency-regression-factor}}
+      - --throughput-regression-factor={{workflow.parameters.throughput-regression-factor}}
+      - --mlflow-experiment={{workflow.parameters.mlflow-experiment}}
+      - --eval-data-path=/input/eval.jsonl
+      - --data-source={{inputs.parameters.data-source}}
+      - --output-dir=/output
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: MLFLOW_TRACKING_URI
+        value: "{{workflow.parameters.mlflow-tracking-uri}}"
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "250m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+      volumeMounts:
+      - name: input
+        mountPath: /input
+      - name: output
+        mountPath: /output
+    volumes:
+    - name: input
+      emptyDir: {}
+    - name: output
+      emptyDir: {}

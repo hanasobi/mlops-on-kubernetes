@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-startup
+  namespace: ml-models
+  labels:
+    app: vllm
+    component: inference
+data:
+  start.sh: |
+    #!/bin/sh
+    set -e
+
+    ARGS="serve TheBloke/Mistral-7B-v0.1-AWQ"
+    ARGS="$ARGS --port=8000"
+    ARGS="$ARGS --max-model-len=4096"
+    ARGS="$ARGS --gpu-memory-utilization=0.88"
+    ARGS="$ARGS --enable-lora"
+    ARGS="$ARGS --max-loras=2"
+    ARGS="$ARGS --max-lora-rank=32"
+
+    # Conditionally register adapter slots that have files
+    LORA_MODULES=""
+
+    if [ -f /mnt/adapters/aws-rag-qa-live/adapter_config.json ]; then
+      echo "Found live adapter slot"
+      LORA_MODULES="aws-rag-qa-live=/mnt/adapters/aws-rag-qa-live"
+    fi
+
+    if [ -f /mnt/adapters/aws-rag-qa-candidate/adapter_config.json ]; then
+      echo "Found candidate adapter slot"
+      if [ -n "$LORA_MODULES" ]; then
+        LORA_MODULES="$LORA_MODULES aws-rag-qa-candidate=/mnt/adapters/aws-rag-qa-candidate"
+      else
+        LORA_MODULES="aws-rag-qa-candidate=/mnt/adapters/aws-rag-qa-candidate"
+      fi
+    fi
+
+    if [ -n "$LORA_MODULES" ]; then
+      ARGS="$ARGS --lora-modules $LORA_MODULES"
+      echo "Starting vLLM with LoRA modules: $LORA_MODULES"
+    else
+      echo "Starting vLLM without LoRA adapters (no adapter files found)"
+    fi
+
+    exec vllm $ARGS

@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: judge-vllm
+  namespace: ml-models
+  labels:
+    app: judge-vllm
+    component: inference
+    model: llama-3.1-70b-instruct-awq
+    version: base
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: judge-vllm
+  template:
+    metadata:
+      labels:
+        app: judge-vllm
+        component: inference
+        model: llama-3.1-70b-instruct-awq
+      annotations:
+        configVersion: "v1"
+    spec:
+      containers:
+      - name: judge-vllm
+        image: vllm/vllm-openai:v0.14.1-cu130
+        command: ["vllm"]
+        args:
+        - "serve"
+        - "hugging-quants/Meta-Llama-3.1-70B-Instruct-AWQ-INT4"
+        - "--port=8000"
+        - "--tensor-parallel-size"
+        - "4"                       
+        - "--dtype"
+        - "auto"
+        - "--max-model-len"
+        - "4096"
+        - "--gpu-memory-utilization"
+        - "0.80"
+        ports:
+        - name: http
+          containerPort: 8000
+          protocol: TCP
+        env:
+        - name: HF_HOME
+          value: "/tmp/huggingface"
+        resources:
+          requests:
+            cpu: "12"
+            memory: "80Gi"
+            nvidia.com/gpu: "4"
+          limits:
+            cpu: "16"
+            memory: "100Gi"
+            nvidia.com/gpu: "4"
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          failureThreshold: 90
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          failureThreshold: 3
+      nodeSelector:
+        workload: gpu-vllm-large
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Equal
+        value: "large-models"
+        effect: NoSchedule
+      terminationGracePeriodSeconds: 60
+      restartPolicy: Always

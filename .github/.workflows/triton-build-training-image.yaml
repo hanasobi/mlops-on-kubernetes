@@ -1,0 +1,150 @@
+name: Build Triton Training Image
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    tags:
+      - 'v*'
+    paths:
+      - 'training/triton/**'
+      - 'docker/triton/Dockerfile.training'
+      - '.github/workflows/triton-build-training-image.yaml'
+
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Custom image tag (optional)'
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-training-image:
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: eu-central-1
+      ACCOUNT_ID: 123456789012
+      IMAGE_NAME: triton-training-tools
+
+    steps:
+      - name: Free disk space
+        run: |
+          echo "Disk space before cleanup:"
+          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          echo "Disk space after cleanup:"
+          df -h /
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: set-tag
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            TAG=${GITHUB_REF#refs/tags/}
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.tag }}" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            TAG="latest"
+          else
+            BRANCH=${GITHUB_REF#refs/heads/}
+            SHORT_SHA=${GITHUB_SHA:0:7}
+            TAG="${BRANCH}-${SHORT_SHA}"
+          fi
+
+          echo "IMAGE_TAG=${TAG}" >> $GITHUB_ENV
+          echo "Building with tag: ${TAG}"
+
+      - name: Request OIDC Token
+        id: idtoken
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const token = await core.getIDToken();
+            core.setOutput("token", token);
+
+      - name: Decode OIDC Token
+        run: |
+          echo "${{ steps.idtoken.outputs.token }}" \
+          | cut -d '.' -f2 \
+          | base64 --decode \
+          | jq .
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build training image
+        run: |
+          echo "Building image with tag: ${IMAGE_TAG}"
+          docker build -f docker/triton/Dockerfile.training \
+            -t ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_NAME}:${IMAGE_TAG} \
+            .
+
+      - name: Test image dependencies
+        run: |
+          echo "Testing that all Python dependencies are importable..."
+          docker run --rm ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_NAME}:${IMAGE_TAG} \
+            python -c "
+          import torch
+          import torchvision
+          import mlflow
+          import onnx
+          import onnxruntime
+          import numpy
+          import yaml
+          import boto3
+          print('All dependencies imported successfully')
+          print(f'PyTorch: {torch.__version__}')
+          print(f'TorchVision: {torchvision.__version__}')
+          print(f'MLflow: {mlflow.__version__}')
+          print(f'ONNX Runtime: {onnxruntime.__version__}')
+          print(f'NumPy: {numpy.__version__}')
+          "
+
+      - name: Push training image
+        run: |
+          echo "Pushing image to ECR..."
+          docker push ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_NAME}:${IMAGE_TAG}
+
+      - name: Check image size
+        run: |
+          IMAGE_SIZE=$(docker images ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_NAME}:${IMAGE_TAG} --format "{{.Size}}")
+          echo "Image size: ${IMAGE_SIZE}"
+
+          SIZE_BYTES=$(docker image inspect ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_NAME}:${IMAGE_TAG} --format='{{.Size}}')
+          SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
+
+          echo "Image size in MB: ${SIZE_MB}"
+
+          if [ ${SIZE_MB} -gt 3072 ]; then
+            echo "Warning: Image size exceeds 3GB (PyTorch images are large, but check if optimization is possible)"
+          fi
+
+      - name: Output image URI
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Training image built and pushed successfully!"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "Image URI:"
+          echo "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_NAME}:${IMAGE_TAG}"
+          echo ""
+          echo "To use in Argo Workflows, update the image field to:"
+          echo "  image: ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_NAME}:${IMAGE_TAG}"
+          echo ""

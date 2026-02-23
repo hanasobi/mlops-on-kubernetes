@@ -1,0 +1,119 @@
+name: Build vLLM Deployment Image
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    tags:
+      - 'v*'
+    paths:
+      - 'deployment/vllm/**'
+      - 'evaluation/vllm/**'
+      - 'performance/vllm/**'
+      - 'docker/vllm/Dockerfile.deployment'
+      - '.github/workflows/vllm-build-deployment-image.yaml'
+
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Custom image tag (optional)'
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-deployment-image:
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: eu-central-1
+      ACCOUNT_ID: 123456789012
+      IMAGE_NAME: vllm-deployment-tools
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: set-tag
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            TAG=${GITHUB_REF#refs/tags/}
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.tag }}" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            TAG="latest"
+          else
+            BRANCH=${GITHUB_REF#refs/heads/}
+            SHORT_SHA=${GITHUB_SHA:0:7}
+            TAG="${BRANCH}-${SHORT_SHA}"
+          fi
+
+          echo "IMAGE_TAG=${TAG}" >> $GITHUB_ENV
+          echo "Building with tag: ${TAG}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push deployment image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/vllm/Dockerfile.deployment
+          push: true
+          tags: ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          cache-from: type=registry,ref=${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}:cache
+          cache-to: type=registry,ref=${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}:cache,mode=max
+
+      - name: Test image dependencies
+        run: |
+          echo "Testing that all Python dependencies are importable..."
+          docker run --rm ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            python -c "
+          import mlflow
+          import boto3
+          import requests
+          print('All dependencies imported successfully')
+          print(f'MLflow: {mlflow.__version__}')
+          "
+
+      - name: Test kubectl
+        run: |
+          docker run --rm ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            kubectl version --client
+
+      - name: Check image size
+        run: |
+          IMAGE_SIZE=$(docker images ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} --format "{{.Size}}")
+          echo "Image size: ${IMAGE_SIZE}"
+
+          SIZE_BYTES=$(docker image inspect ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} --format='{{.Size}}')
+          SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
+
+          echo "Image size in MB: ${SIZE_MB}"
+
+          if [ ${SIZE_MB} -gt 1024 ]; then
+            echo "Warning: Image size exceeds 1GB"
+          fi
+
+      - name: Output image URI
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "vLLM deployment image built and pushed successfully!"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "Image URI:"
+          echo "${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          echo ""

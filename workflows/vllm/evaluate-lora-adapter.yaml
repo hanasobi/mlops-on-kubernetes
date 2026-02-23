@@ -1,0 +1,330 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: evaluate-lora-
+  namespace: ml-models
+  labels:
+    workflows.argoproj.io/workflow-type: evaluation
+    model: mistral-7b-lora
+spec:
+  serviceAccountName: workflow-sa
+
+  entrypoint: evaluate-pipeline
+
+  arguments:
+    parameters:
+    - name: model-name
+      value: "mistral-7b-lora"
+
+    - name: candidate-adapter
+      value: "aws-rag-qa-candidate"
+
+    - name: live-adapter
+      value: "aws-rag-qa-live"
+
+    - name: vllm-url
+      value: "http://vllm-service.ml-models:8000"
+
+    - name: judge-url
+      value: "http://judge-vllm-service.ml-models:8000"
+
+    - name: judge-model
+      value: ""
+
+    - name: mlflow-tracking-uri
+      value: "http://mlflow.ai-platform:80"
+
+    - name: s3-data-bucket
+      value: "s3://my-vllm-data"
+
+    - name: max-concurrent
+      value: "15"
+
+    - name: min-a-rate
+      value: "0.70"
+
+    - name: max-c-rate
+      value: "0.10"
+
+    - name: min-refusal-rate
+      value: "0.90"
+
+    - name: mlflow-experiment
+      value: "vllm-lora-evaluation"
+
+  templates:
+  - name: evaluate-pipeline
+    steps:
+    # Step 1: Download evaluation data from S3
+    - - name: download-eval-data
+        template: download-eval-data-step
+
+    # Step 2: Run inference on both adapters in parallel
+    - - name: inference-candidate
+        template: inference-step
+        arguments:
+          parameters:
+          - name: adapter-name
+            value: "{{workflow.parameters.candidate-adapter}}"
+          artifacts:
+          - name: eval-data
+            from: "{{steps.download-eval-data.outputs.artifacts.eval-data}}"
+
+      - name: inference-live
+        template: inference-step
+        continueOn:
+          failed: true
+        arguments:
+          parameters:
+          - name: adapter-name
+            value: "{{workflow.parameters.live-adapter}}"
+          artifacts:
+          - name: eval-data
+            from: "{{steps.download-eval-data.outputs.artifacts.eval-data}}"
+
+    # Step 3: Judge answers from both adapters
+    - - name: judge-answers
+        template: judge-step
+        arguments:
+          artifacts:
+          - name: candidate-results
+            from: "{{steps.inference-candidate.outputs.artifacts.inference-results}}"
+          - name: live-results
+            from: "{{steps.inference-live.outputs.artifacts.inference-results}}"
+
+    # Step 4: Compare results and decide
+    - - name: compare-decision
+        template: compare-step
+        arguments:
+          parameters:
+          - name: data-source
+            value: "{{workflow.parameters.s3-data-bucket}}/data/processed/{{steps.download-eval-data.outputs.parameters.data-version}}/eval.jsonl"
+          artifacts:
+          - name: judge-results
+            from: "{{steps.judge-answers.outputs.artifacts.judge-results}}"
+          - name: candidate-inference
+            from: "{{steps.inference-candidate.outputs.artifacts.inference-results}}"
+          - name: live-inference
+            from: "{{steps.inference-live.outputs.artifacts.inference-results}}"
+          - name: eval-data
+            from: "{{steps.download-eval-data.outputs.artifacts.eval-data}}"
+
+  # Step Template Definitions
+
+  - name: download-eval-data-step
+    outputs:
+      artifacts:
+      - name: eval-data
+        path: /data/eval.jsonl
+      parameters:
+      - name: data-version
+        valueFrom:
+          path: /data/data_version.txt
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/vllm-deployment-tools:latest
+      imagePullPolicy: Always
+      command: [sh, -c]
+      args:
+      - |
+        echo "Resolving data version from MLflow..."
+
+        # Query MLflow for the candidate adapter's data.version tag
+        DATA_VERSION=$(python3 -c "
+        import mlflow
+        from mlflow.tracking import MlflowClient
+        client = MlflowClient()
+        mv = client.get_model_version_by_alias('{{workflow.parameters.model-name}}', 'staged')
+        run = client.get_run(mv.run_id)
+        print(run.data.tags.get('data.version', ''))
+        ")
+
+        if [ -z "$DATA_VERSION" ]; then
+          echo "ERROR: Could not resolve data.version from MLflow"
+          exit 1
+        fi
+
+        echo "Data version: $DATA_VERSION"
+        echo -n "$DATA_VERSION" > /data/data_version.txt
+
+        echo "Downloading evaluation data..."
+        aws s3 cp {{workflow.parameters.s3-data-bucket}}/data/processed/${DATA_VERSION}/eval.jsonl /data/eval.jsonl
+        echo "Download complete"
+        wc -l /data/eval.jsonl
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: MLFLOW_TRACKING_URI
+        value: "{{workflow.parameters.mlflow-tracking-uri}}"
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "250m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+      volumeMounts:
+      - name: data
+        mountPath: /data
+    volumes:
+    - name: data
+      emptyDir: {}
+
+  - name: inference-step
+    inputs:
+      parameters:
+      - name: adapter-name
+      artifacts:
+      - name: eval-data
+        path: /data/eval.jsonl
+    outputs:
+      artifacts:
+      - name: inference-results
+        path: /output/inference_results.json
+      parameters:
+      - name: status
+        valueFrom:
+          path: /output/inference_status.txt
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/vllm-deployment-tools:latest
+      imagePullPolicy: Always
+      command: [python, /eval-scripts/steps/run_inference.py]
+      args:
+      - --vllm-url={{workflow.parameters.vllm-url}}
+      - --adapter-name={{inputs.parameters.adapter-name}}
+      - --eval-data-path=/data/eval.jsonl
+      - --max-tokens=512
+      - --temperature=0.0
+      - --max-concurrent={{workflow.parameters.max-concurrent}}
+      - --output-dir=/output
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      resources:
+        requests:
+          memory: "512Mi"
+          cpu: "500m"
+        limits:
+          memory: "1Gi"
+          cpu: "1000m"
+      volumeMounts:
+      - name: data
+        mountPath: /data
+      - name: output
+        mountPath: /output
+    volumes:
+    - name: data
+      emptyDir: {}
+    - name: output
+      emptyDir: {}
+
+  - name: judge-step
+    inputs:
+      artifacts:
+      - name: candidate-results
+        path: /input/candidate_results.json
+      - name: live-results
+        path: /input/live_results.json
+        optional: true
+    outputs:
+      artifacts:
+      - name: judge-results
+        path: /output/judge_results.json
+      parameters:
+      - name: status
+        valueFrom:
+          path: /output/judge_status.txt
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/vllm-deployment-tools:latest
+      imagePullPolicy: Always
+      command: [python, /eval-scripts/steps/run_judge.py]
+      args:
+      - --judge-url={{workflow.parameters.judge-url}}
+      - --judge-model={{workflow.parameters.judge-model}}
+      - --candidate-results=/input/candidate_results.json
+      - --live-results=/input/live_results.json
+      - --max-concurrent={{workflow.parameters.max-concurrent}}
+      - --max-tokens=128
+      - --output-dir=/output
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      resources:
+        requests:
+          memory: "512Mi"
+          cpu: "500m"
+        limits:
+          memory: "1Gi"
+          cpu: "1000m"
+      volumeMounts:
+      - name: input
+        mountPath: /input
+      - name: output
+        mountPath: /output
+    volumes:
+    - name: input
+      emptyDir: {}
+    - name: output
+      emptyDir: {}
+
+  - name: compare-step
+    inputs:
+      parameters:
+      - name: data-source
+      artifacts:
+      - name: judge-results
+        path: /input/judge_results.json
+      - name: candidate-inference
+        path: /input/candidate_inference.json
+      - name: live-inference
+        path: /input/live_inference.json
+        optional: true
+      - name: eval-data
+        path: /input/eval.jsonl
+        optional: true
+    outputs:
+      artifacts:
+      - name: eval-decision
+        path: /output/eval_decision.json
+      parameters:
+      - name: status
+        valueFrom:
+          path: /output/eval_status.txt
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/vllm-deployment-tools:latest
+      imagePullPolicy: Always
+      command: [python, /eval-scripts/steps/compare_decision.py]
+      args:
+      - --judge-results=/input/judge_results.json
+      - --candidate-inference=/input/candidate_inference.json
+      - --live-inference=/input/live_inference.json
+      - --model-name={{workflow.parameters.model-name}}
+      - --candidate-source=alias:staged
+      - --min-a-rate={{workflow.parameters.min-a-rate}}
+      - --max-c-rate={{workflow.parameters.max-c-rate}}
+      - --min-refusal-rate={{workflow.parameters.min-refusal-rate}}
+      - --mlflow-experiment={{workflow.parameters.mlflow-experiment}}
+      - --eval-data-path=/input/eval.jsonl
+      - --data-source={{inputs.parameters.data-source}}
+      - --output-dir=/output
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: MLFLOW_TRACKING_URI
+        value: "{{workflow.parameters.mlflow-tracking-uri}}"
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "250m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+      volumeMounts:
+      - name: input
+        mountPath: /input
+      - name: output
+        mountPath: /output
+    volumes:
+    - name: input
+      emptyDir: {}
+    - name: output
+      emptyDir: {}

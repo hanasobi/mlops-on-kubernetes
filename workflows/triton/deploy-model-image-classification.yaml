@@ -1,0 +1,449 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: deploy-resnet18-
+  namespace: ml-models
+  labels:
+    workflows.argoproj.io/workflow-type: deployment
+    model: resnet18-imagenette-onnx
+spec:
+  # Service Account with IRSA annotation for AWS S3 access
+  serviceAccountName: workflow-sa
+  
+  # Entry Point
+  entrypoint: deploy-pipeline
+  
+  # Workflow-wide parameters
+  arguments:
+    parameters:
+    # FIXED: Model name with hyphens (as in MLflow)
+    - name: model-name
+      value: "resnet18-imagenette-onnx"
+    
+    # Source for the model - "alias:deploy" or "version:5"
+    - name: source
+      value: "alias:deploy"
+    
+    # Optional: Force a specific Triton version
+    - name: force-version
+      value: ""
+    
+    # MLflow Tracking Server URL
+    - name: mlflow-tracking-uri
+      value: "http://mlflow.ai-platform:80"
+    
+    # S3 Bucket for Triton Model Repository
+    - name: s3-bucket
+      value: "my-triton-models"
+    
+    # FIXED: Triton Service URL
+    - name: triton-url
+      value: "http://triton-inference.ml-models:8000"
+    
+    # Expected Model Shapes (for verification)
+    - name: expected-input-shape
+      value: "[1, 3, 224, 224]"
+    
+    - name: expected-output-shape
+      value: "[1, 10]"
+  
+  templates:
+  - name: deploy-pipeline
+    steps:
+    # Step 1: Fetch Model from MLflow
+    - - name: fetch-model
+        template: fetch-model-step
+        arguments:
+          parameters:
+          - name: model-name
+            value: "{{workflow.parameters.model-name}}"
+          - name: source
+            value: "{{workflow.parameters.source}}"
+          - name: mlflow-tracking-uri
+            value: "{{workflow.parameters.mlflow-tracking-uri}}"
+    
+    # Step 2: Determine Next Triton Version
+    - - name: determine-version
+        template: determine-version-step
+        arguments:
+          parameters:
+          - name: model-name
+            value: "{{workflow.parameters.model-name}}"
+          - name: s3-bucket
+            value: "{{workflow.parameters.s3-bucket}}"
+          - name: force-version
+            value: "{{workflow.parameters.force-version}}"
+    
+    # Step 3: Prepare Deployment Artifacts
+    - - name: prepare-artifacts
+        template: prepare-artifacts-step
+        arguments:
+          parameters:
+          - name: model-name
+            value: "{{workflow.parameters.model-name}}"
+          artifacts:
+          - name: mlflow-metadata
+            from: "{{steps.fetch-model.outputs.artifacts.mlflow-metadata}}"
+          - name: model-file
+            from: "{{steps.fetch-model.outputs.artifacts.model-file}}"
+          - name: triton-version
+            from: "{{steps.determine-version.outputs.artifacts.triton-version}}"
+    
+    # Step 4: Upload to S3
+    - - name: upload-to-s3
+        template: upload-to-s3-step
+        arguments:
+          parameters:
+          - name: model-name
+            value: "{{workflow.parameters.model-name}}"
+          - name: s3-bucket
+            value: "{{workflow.parameters.s3-bucket}}"
+          artifacts:
+          - name: triton-version
+            from: "{{steps.determine-version.outputs.artifacts.triton-version}}"
+          - name: artifacts
+            from: "{{steps.prepare-artifacts.outputs.artifacts.deployment-artifacts}}"
+    
+    # Step 5: Reload Triton
+    - - name: reload-triton
+        template: reload-triton-step
+        arguments:
+          parameters:
+          - name: model-name
+            value: "{{workflow.parameters.model-name}}"
+          - name: triton-url
+            value: "{{workflow.parameters.triton-url}}"
+          artifacts:
+          - name: triton-version
+            from: "{{steps.determine-version.outputs.artifacts.triton-version}}"
+    
+    # Steps 6 & 7: Update Aliases and Verify Deployment (PARALLEL)
+    - - name: update-aliases
+        template: update-aliases-step
+        arguments:
+          parameters:
+          - name: model-name
+            value: "{{workflow.parameters.model-name}}"
+          - name: mlflow-tracking-uri
+            value: "{{workflow.parameters.mlflow-tracking-uri}}"
+          artifacts:
+          - name: metadata
+            from: "{{steps.prepare-artifacts.outputs.artifacts.metadata}}"
+      
+      - name: verify-deployment
+        template: verify-deployment-step
+        arguments:
+          parameters:
+          - name: model-name
+            value: "{{workflow.parameters.model-name}}"
+          - name: triton-url
+            value: "{{workflow.parameters.triton-url}}"
+          - name: expected-input-shape
+            value: "{{workflow.parameters.expected-input-shape}}"
+          - name: expected-output-shape
+            value: "{{workflow.parameters.expected-output-shape}}"
+  
+  # Step Template Definitions
+  
+  - name: fetch-model-step
+    inputs:
+      parameters:
+      - name: model-name
+      - name: source
+      - name: mlflow-tracking-uri
+    outputs:
+      artifacts:
+      - name: mlflow-metadata
+        path: /output/mlflow_metadata.json
+      - name: model-file
+        path: /output/model.onnx
+    container:
+      # FIXED: Image Name
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/mlops-deployment-tools:latest
+      imagePullPolicy: Always
+      command: [python, /scripts/steps/fetch_model.py]
+      args:
+      - --model-name={{inputs.parameters.model-name}}
+      - --source={{inputs.parameters.source}}
+      - --output-dir=/output
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: MLFLOW_TRACKING_URI
+        value: "{{inputs.parameters.mlflow-tracking-uri}}"
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "100m"
+        limits:
+          memory: "512Mi"
+          cpu: "250m"
+      volumeMounts:
+      - name: output
+        mountPath: /output
+    volumes:
+    - name: output
+      emptyDir: {}
+  
+  - name: determine-version-step
+    inputs:
+      parameters:
+      - name: model-name
+      - name: s3-bucket
+      - name: force-version
+    outputs:
+      artifacts:
+      - name: triton-version
+        path: /output/triton_version.txt
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/mlops-deployment-tools:latest
+      imagePullPolicy: Always
+      command: [python, /scripts/steps/determine_version.py]
+      args:
+      - --model-name={{inputs.parameters.model-name}}
+      - --bucket={{inputs.parameters.s3-bucket}}
+      - --output-dir=/output
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: AWS_REGION
+        value: eu-central-1
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "100m"
+        limits:
+          memory: "512Mi"
+          cpu: "250m"
+      volumeMounts:
+      - name: output
+        mountPath: /output
+    volumes:
+    - name: output
+      emptyDir: {}
+  
+  - name: prepare-artifacts-step
+    inputs:
+      parameters:
+      - name: model-name
+      artifacts:
+      - name: mlflow-metadata
+        path: /input/mlflow_metadata.json
+      - name: model-file
+        path: /input/model.onnx
+      - name: triton-version
+        path: /input/triton_version.txt
+    outputs:
+      artifacts:
+      - name: deployment-artifacts
+        path: /output
+        archive:
+          none: {}
+      - name: metadata
+        path: /output/metadata.json
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/mlops-deployment-tools:latest
+      imagePullPolicy: Always
+      command: [python, /scripts/steps/prepare_artifacts.py]
+      args:
+      - --mlflow-metadata=/input/mlflow_metadata.json
+      - --triton-version=/input/triton_version.txt
+      - --model-file=/input/model.onnx
+      - --output-dir=/output
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: ARGO_WORKFLOW_NAME
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.name
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "100m"
+        limits:
+          memory: "512Mi"
+          cpu: "250m"
+      volumeMounts:
+      - name: input
+        mountPath: /input
+      - name: output
+        mountPath: /output
+    volumes:
+    - name: input
+      emptyDir: {}
+    - name: output
+      emptyDir: {}
+  
+  - name: upload-to-s3-step
+    inputs:
+      parameters:
+      - name: model-name
+      - name: s3-bucket
+      artifacts:
+      - name: triton-version
+        path: /input/triton_version.txt
+      - name: artifacts
+        path: /input/artifacts
+    outputs:
+      artifacts:
+      - name: s3-uri
+        path: /output/s3_uri.txt
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/mlops-deployment-tools:latest
+      imagePullPolicy: Always
+      command: [sh, -c]
+      args:
+      - |
+        python /scripts/steps/upload_to_s3.py \
+          --model-name={{inputs.parameters.model-name}} \
+          --bucket={{inputs.parameters.s3-bucket}} \
+          --triton-version=$(cat /input/triton_version.txt) \
+          --artifacts-dir=/input/artifacts \
+          --output-dir=/output
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: AWS_REGION
+        value: eu-central-1
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "100m"
+        limits:
+          memory: "512Mi"
+          cpu: "250m"
+      volumeMounts:
+      - name: input
+        mountPath: /input
+      - name: output
+        mountPath: /output
+    volumes:
+    - name: input
+      emptyDir: {}
+    - name: output
+      emptyDir: {}
+  
+  - name: reload-triton-step
+    inputs:
+      parameters:
+      - name: model-name
+      - name: triton-url
+      artifacts:
+      - name: triton-version
+        path: /input/triton_version.txt
+    outputs:
+      artifacts:
+      - name: loaded-version
+        path: /output/loaded_version.txt
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/mlops-deployment-tools:latest
+      imagePullPolicy: Always
+      command: [sh, -c]
+      args:
+      - |
+        python /scripts/steps/reload_triton.py \
+          --model-name={{inputs.parameters.model-name}} \
+          --triton-url={{inputs.parameters.triton-url}} \
+          --expected-version=$(cat /input/triton_version.txt) \
+          --load-timeout=120 \
+          --output-dir=/output
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "100m"
+        limits:
+          memory: "512Mi"
+          cpu: "250m"
+      volumeMounts:
+      - name: input
+        mountPath: /input
+      - name: output
+        mountPath: /output
+    volumes:
+    - name: input
+      emptyDir: {}
+    - name: output
+      emptyDir: {}
+  
+  - name: update-aliases-step
+    inputs:
+      parameters:
+      - name: model-name
+      - name: mlflow-tracking-uri
+      artifacts:
+      - name: metadata
+        path: /input/metadata.json
+    outputs:
+      artifacts:
+      - name: alias-updates
+        path: /output/alias_updates.json
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/mlops-deployment-tools:latest
+      imagePullPolicy: Always
+      command: [sh, -c]
+      args:
+      - |
+        python /scripts/steps/update_aliases.py \
+          --model-name={{inputs.parameters.model-name}} \
+          --mlflow-tracking-uri={{inputs.parameters.mlflow-tracking-uri}} \
+          --mlflow-version=$(cat /input/metadata.json | jq -r '.mlflow.version') \
+          --output-dir=/output
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: MLFLOW_TRACKING_URI
+        value: "{{inputs.parameters.mlflow-tracking-uri}}"
+      resources:
+        requests:
+          cpu: "250m"
+          memory: "512Mi"
+        limits:
+          cpu: "500m"
+          memory: "1Gi"
+      volumeMounts:
+      - name: input
+        mountPath: /input
+      - name: output
+        mountPath: /output
+    volumes:
+    - name: input
+      emptyDir: {}
+    - name: output
+      emptyDir: {}
+  
+  - name: verify-deployment-step
+    inputs:
+      parameters:
+      - name: model-name
+      - name: triton-url
+      - name: expected-input-shape
+      - name: expected-output-shape
+    outputs:
+      artifacts:
+      - name: verification-result
+        path: /output/verification_result.json
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/mlops-deployment-tools:latest
+      imagePullPolicy: Always
+      command: [python, /scripts/steps/verify_deployment.py]
+      args:
+      - --model-name={{inputs.parameters.model-name}}
+      - --triton-url={{inputs.parameters.triton-url}}
+      - --expected-input-shape={{inputs.parameters.expected-input-shape}}
+      - --expected-output-shape={{inputs.parameters.expected-output-shape}}
+      - --num-test-requests=5
+      - --output-dir=/output
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "100m"
+        limits:
+          memory: "512Mi"
+          cpu: "250m"
+      volumeMounts:
+      - name: output
+        mountPath: /output
+    volumes:
+    - name: output
+      emptyDir: {}

@@ -1,0 +1,22 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: vllm-inference
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/your-org/mlops-on-kubernetes
+    targetRevision: main
+    path: infra/k8s/vllm/base
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ml-models 
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=false  # Namespace already exists

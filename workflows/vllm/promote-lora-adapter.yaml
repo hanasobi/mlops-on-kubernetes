@@ -1,0 +1,62 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: promote-lora-
+  namespace: ml-models
+  labels:
+    workflows.argoproj.io/workflow-type: promotion
+    model: mistral-7b-lora
+spec:
+  serviceAccountName: workflow-sa
+
+  entrypoint: promote
+
+  arguments:
+    parameters:
+    - name: model-name
+      value: "mistral-7b-lora"
+
+    - name: source-alias
+      value: "staged"
+
+    - name: deployment
+      value: "vllm"
+
+    - name: namespace
+      value: "ml-models"
+
+    - name: vllm-url
+      value: "http://vllm-service.ml-models:8000"
+
+    - name: mlflow-tracking-uri
+      value: "http://mlflow.ai-platform:80"
+
+  templates:
+  - name: promote
+    steps:
+    - - name: promote-adapter
+        template: promote-step
+
+  - name: promote-step
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/vllm-deployment-tools:latest
+      imagePullPolicy: Always
+      command: [python, /scripts/steps/promote_adapter.py]
+      args:
+      - --model-name={{workflow.parameters.model-name}}
+      - --source-alias={{workflow.parameters.source-alias}}
+      - --deployment={{workflow.parameters.deployment}}
+      - --namespace={{workflow.parameters.namespace}}
+      - --vllm-url={{workflow.parameters.vllm-url}}
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: MLFLOW_TRACKING_URI
+        value: "{{workflow.parameters.mlflow-tracking-uri}}"
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "250m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"

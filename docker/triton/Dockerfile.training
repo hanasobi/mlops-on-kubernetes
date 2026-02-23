@@ -1,0 +1,43 @@
+FROM python:3.11-slim
+
+LABEL maintainer="your-org"
+LABEL purpose="training-workflows"
+LABEL description="Image for Triton model training, promotion, export and validation"
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    unzip \
+    jq \
+    libgomp1 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# PyTorch first (largest dependency, separate layer for caching)
+RUN pip install --no-cache-dir \
+    torch \
+    torchvision
+
+# Remaining Python dependencies
+RUN pip install --no-cache-dir \
+    'mlflow>=2.9,<3.0' \
+    boto3 \
+    onnx \
+    onnxruntime \
+    onnxscript \
+    numpy \
+    pyyaml
+
+# Install AWS CLI v2 (used by train.py for S3 dataset download)
+RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && \
+    unzip awscliv2.zip && \
+    ./aws/install && \
+    rm -rf awscliv2.zip aws
+
+# Copy training scripts
+COPY training/triton/ /scripts/
+
+# Set Python module search path
+ENV PYTHONPATH=/scripts
+
+WORKDIR /workspace

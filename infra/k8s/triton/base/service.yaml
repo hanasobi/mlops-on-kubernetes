@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: triton-inference
+  labels:
+    app: triton-inference
+spec:
+  type: ClusterIP # Internal - Ingress if external
+  selector:
+    app: triton-inference
+  ports:
+  - name: http
+    port: 8000
+    targetPort: http
+    protocol: TCP
+  - name: grpc
+    port: 8001
+    targetPort: grpc
+    protocol: TCP
+  - name: metrics
+    port: 8002
+    targetPort: metrics
+    protocol: TCP

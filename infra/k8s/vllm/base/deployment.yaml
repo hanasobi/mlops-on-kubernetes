@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: ml-models
+  labels:
+    app: vllm
+    component: inference
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+        version: v1
+    spec:
+      serviceAccountName: vllm-sa
+
+      initContainers:
+      - name: load-adapters
+        image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/vllm-deployment-tools:latest
+        command: [python, /scripts/steps/init_load_adapters.py]
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: MLFLOW_TRACKING_URI
+          value: "http://mlflow.ai-platform:80"
+        - name: MODEL_NAME
+          value: "mistral-7b-lora"
+        volumeMounts:
+        - name: adapter-storage
+          mountPath: /mnt/adapters
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:v0.14.1-cu130
+        command: ["/bin/sh", "/scripts/start.sh"]
+        env:
+        - name: HF_HOME
+          value: "/tmp/huggingface"
+        - name: VLLM_ALLOW_RUNTIME_LORA_UPDATING
+          value: "True"
+        ports:
+        - name: http
+          containerPort: 8000
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 30
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: "3"
+            memory: "12Gi"
+            nvidia.com/gpu: "1"
+          limits:
+            cpu: "4"
+            memory: "14Gi"
+            nvidia.com/gpu: "1"
+        volumeMounts:
+        - name: adapter-storage
+          mountPath: /mnt/adapters
+        - name: vllm-startup
+          mountPath: /scripts
+          readOnly: true
+
+      nodeSelector:
+        workload: gpu-vllm
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+
+      volumes:
+      - name: adapter-storage
+        emptyDir: {}
+      - name: vllm-startup
+        configMap:
+          name: vllm-startup
+          defaultMode: 0755

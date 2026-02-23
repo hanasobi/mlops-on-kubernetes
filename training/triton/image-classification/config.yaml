@@ -1,0 +1,87 @@
+# ResNet18 ImageNette Training Configuration
+# This config defines all hyperparameters and settings for training
+
+model:
+  # Model name - used for MLflow Run Name and Model Registry
+  name: "resnet18-imagenette"
+  
+  # Architecture - which model we use
+  # Options: resnet18, resnet34, resnet50
+  architecture: "resnet18"
+  
+  # ===== NEW: Experiment Categorization =====
+  # These fields categorize which training approach we use
+  # They are logged as MLflow tags for later filtering and analysis
+  
+  # Approach: Which training strategy do we use?
+  # Options:
+  #   - "baseline": Training from scratch, no pretrained weights
+  #   - "feature_extraction": Pretrained backbone frozen, only classifier trained
+  #   - "fine_tuning": Pretrained weights, all or some layers trainable
+  approach: "baseline"
+  
+  # Pretrained: Do we use pretrained weights as a starting point?
+  # true: Load ImageNet pretrained weights
+  # false: Initialize all weights randomly
+  pretrained: false
+  
+  # Frozen Layers: Which parts of the model are frozen (not trainable)?
+  # null: Nothing is frozen, all layers trainable (baseline or full fine-tuning)
+  # "backbone": Only backbone frozen, classifier trainable (feature extraction)
+  # "partial": Only early layers frozen (progressive fine-tuning, advanced)
+  frozen_layers: null
+  
+  # ===== End NEW =====
+
+experiment:
+  # MLflow Experiment Name - groups related runs together
+  # All runs of this model (baseline, feature extraction, fine-tuning)
+  # go into the same experiment because they solve the same problem
+  # and their performance is directly comparable
+  name: "imagenette-classification"
+
+training:
+  # Batch Size - how many images per training step
+  # GPU memory is the limiting factor here
+  # ResNet18 on T4 (16GB VRAM) can easily handle 64 or even 128
+  batch_size: 64
+  
+  # Learning Rate - how large the optimizer steps are
+  # IMPORTANT: This value is optimized for baseline (from scratch)
+  # For pretrained approaches (feature extraction, fine-tuning)
+  # the LR should typically be smaller (0.0001 - 0.001)
+  # For now we keep it at 0.001 for baseline
+  learning_rate: 0.001
+  
+  # Number of epochs - how many times to iterate through the complete dataset
+  # ImageNette is small, 10 epochs should suffice for the first test
+  # Phase 1 showed that a plateau is often reached after 10-12 epochs
+  epochs: 10
+  
+  # Optimizer - which optimization algorithm to use
+  # Options: "adam", "sgd"
+  # Adam is generally easier to tune than SGD
+  optimizer: "adam"
+
+data:
+  # S3 path to the dataset
+  # This is the root path - train/ and val/ are appended automatically
+  s3_path: "s3://my-dvc-storage/datasets/imagenette/imagenette2-160"
+  
+  # Number of DataLoader worker threads
+  # More workers = more parallel data loading
+  # 4 is optimal for most setups (from Phase 1 benchmarking)
+  num_workers: 4
+
+# Promotion Criteria
+# Which metric decides whether a model gets promoted
+metric:
+  name: "best_val_accuracy"
+  greater_is_better: true
+  
+# Threshold - Model must be at least this good (safety net)
+# Min Improvement - Must be at least better than the current champion
+promotion_criteria:
+  threshold: 0.90
+  min_improvement: 0.005  # 0.5%
+  

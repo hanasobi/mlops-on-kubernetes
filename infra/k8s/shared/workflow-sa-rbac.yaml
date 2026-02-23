@@ -1,0 +1,40 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: workflow-manager
+  namespace: ml-models
+rules:
+
+# Allow managing pods (for wait, exec, cp)
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "patch", "update", "watch"]
+
+# Allow exec into pods
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+
+# Allow reading pod logs (useful for debugging)
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+
+# Allow restarting deployments (used by vLLM deployment workflow)
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: workflow-manager-binding
+  namespace: ml-models
+subjects:
+- kind: ServiceAccount
+  name: workflow-sa
+  namespace: ml-models
+roleRef:
+  kind: Role
+  name: workflow-manager
+  apiGroup: rbac.authorization.k8s.io

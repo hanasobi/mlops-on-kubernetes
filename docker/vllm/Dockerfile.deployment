@@ -1,0 +1,44 @@
+FROM python:3.11-slim
+
+LABEL maintainer="your-org"
+LABEL purpose="vllm-lora-deployment"
+LABEL description="Lightweight image for vLLM LoRA adapter deployment workflows"
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    unzip \
+    jq \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install kubectl
+RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && \
+    chmod +x kubectl && \
+    mv kubectl /usr/local/bin/
+
+# Python dependencies (lightweight — no PyTorch)
+RUN pip install --no-cache-dir \
+    'mlflow>=2.9,<3.0' \
+    boto3 \
+    requests
+
+# Install AWS CLI v2
+RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && \
+    unzip awscliv2.zip && \
+    ./aws/install && \
+    rm -rf awscliv2.zip aws
+
+# Copy deployment scripts
+COPY deployment/vllm/ /scripts/
+
+# Copy evaluation scripts
+COPY evaluation/vllm/ /eval-scripts/
+
+# Copy performance scripts
+COPY performance/vllm/ /perf-scripts/
+
+# Set Python module search path
+ENV PYTHONPATH=/scripts:/eval-scripts:/perf-scripts
+
+WORKDIR /workspace

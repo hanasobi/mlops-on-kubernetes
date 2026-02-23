@@ -1,0 +1,154 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: deploy-lora-
+  namespace: ml-models
+  labels:
+    workflows.argoproj.io/workflow-type: deployment
+    model: mistral-7b-lora
+spec:
+  serviceAccountName: workflow-sa
+
+  entrypoint: deploy-pipeline
+
+  arguments:
+    parameters:
+    - name: model-name
+      value: "mistral-7b-lora"
+
+    - name: adapter-source
+      value: "alias:candidate"
+
+    - name: slot-name
+      value: "aws-rag-qa-candidate"
+
+    - name: vllm-url
+      value: "http://vllm-service.ml-models:8000"
+
+    - name: mlflow-tracking-uri
+      value: "http://mlflow.ai-platform:80"
+
+  templates:
+  - name: deploy-pipeline
+    steps:
+    # Step 1: Download from MLflow, copy to vLLM pod, load via API
+    - - name: load-adapter
+        template: load-adapter-step
+
+    # Step 2: Smoke test the candidate adapter
+    - - name: smoke-test
+        template: smoke-test-step
+
+    # Step 3: Set 'staged' alias in MLflow after smoke test passes
+    - - name: set-staged-alias
+        template: set-staged-alias-step
+
+  # Step Template Definitions
+
+  - name: load-adapter-step
+    outputs:
+      artifacts:
+      - name: load-result
+        path: /output/load_result.json
+      parameters:
+      - name: status
+        valueFrom:
+          path: /output/load_result_status.txt
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/vllm-deployment-tools:latest
+      imagePullPolicy: Always
+      command: [python, /scripts/steps/load_adapter.py]
+      args:
+      - --model-name={{workflow.parameters.model-name}}
+      - --source={{workflow.parameters.adapter-source}}
+      - --slot-name={{workflow.parameters.slot-name}}
+      - --deployment=vllm
+      - --namespace=ml-models
+      - --vllm-url={{workflow.parameters.vllm-url}}
+      - --output-dir=/output
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: MLFLOW_TRACKING_URI
+        value: "{{workflow.parameters.mlflow-tracking-uri}}"
+      resources:
+        requests:
+          memory: "512Mi"
+          cpu: "250m"
+        limits:
+          memory: "1Gi"
+          cpu: "500m"
+      volumeMounts:
+      - name: output
+        mountPath: /output
+    volumes:
+    - name: output
+      emptyDir: {}
+
+  - name: smoke-test-step
+    outputs:
+      artifacts:
+      - name: smoke-test-result
+        path: /output/smoke_test_result.json
+      parameters:
+      - name: status
+        valueFrom:
+          path: /output/smoke_test_status.txt
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/vllm-deployment-tools:latest
+      imagePullPolicy: Always
+      command: [python, /scripts/steps/smoke_test.py]
+      args:
+      - --vllm-url={{workflow.parameters.vllm-url}}
+      - --adapter-name={{workflow.parameters.slot-name}}
+      - --num-requests=3
+      - --max-latency=30
+      - --output-dir=/output
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "250m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+      volumeMounts:
+      - name: output
+        mountPath: /output
+    volumes:
+    - name: output
+      emptyDir: {}
+
+  - name: set-staged-alias-step
+    outputs:
+      artifacts:
+      - name: staged-alias-result
+        path: /output/staged_alias_result.txt
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/vllm-deployment-tools:latest
+      imagePullPolicy: Always
+      command: [python, /scripts/steps/set_staged_alias.py]
+      args:
+      - --model-name={{workflow.parameters.model-name}}
+      - --source={{workflow.parameters.adapter-source}}
+      - --output-dir=/output
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: MLFLOW_TRACKING_URI
+        value: "{{workflow.parameters.mlflow-tracking-uri}}"
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "250m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+      volumeMounts:
+      - name: output
+        mountPath: /output
+    volumes:
+    - name: output
+      emptyDir: {}

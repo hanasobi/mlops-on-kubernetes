@@ -1,0 +1,48 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# Environment & Secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+credentials.json
+secrets.yaml
+secrets.yml
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# Node (if applicable)
+node_modules/
+
+# Logs
+*.log
+

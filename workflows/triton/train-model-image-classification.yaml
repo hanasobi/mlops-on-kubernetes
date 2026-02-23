@@ -1,0 +1,231 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: train-resnet18-
+  namespace: ml-models
+  labels:
+    workflows.argoproj.io/workflow-type: training
+    model: resnet18-imagenette
+spec:
+  # Service Account with IRSA annotation for AWS S3 access
+  serviceAccountName: workflow-sa
+
+  # Entry Point
+  entrypoint: training-pipeline
+
+  # Workflow-wide parameters
+  arguments:
+    parameters:
+    # Model name (as in MLflow Registry)
+    - name: model-name
+      value: "resnet18-imagenette"
+
+    # MLflow Tracking Server URL
+    - name: mlflow-tracking-uri
+      value: "http://mlflow.ai-platform:80"
+
+    # Input shape for ONNX export (comma-separated)
+    - name: input-shape
+      value: "1,3,224,224"
+
+    # Training hyperparameter overrides (empty = use config.yaml defaults)
+    - name: epochs
+      value: ""
+
+    - name: learning-rate
+      value: ""
+
+    - name: batch-size
+      value: ""
+
+  templates:
+  - name: training-pipeline
+    steps:
+    # Step 1: Train model on ImageNette
+    - - name: train
+        template: train-step
+        arguments:
+          parameters:
+          - name: epochs
+            value: "{{workflow.parameters.epochs}}"
+          - name: learning-rate
+            value: "{{workflow.parameters.learning-rate}}"
+          - name: batch-size
+            value: "{{workflow.parameters.batch-size}}"
+
+    # Step 2: Promote model (Quality Gate 1 - Training Performance)
+    - - name: promote
+        template: promote-step
+        arguments:
+          parameters:
+          - name: run-id
+            value: "{{steps.train.outputs.parameters.run-id}}"
+
+    # Step 3: Export champion to ONNX (only if promoted)
+    - - name: export-onnx
+        template: export-onnx-step
+        when: "{{steps.promote.outputs.parameters.result}} == passed"
+        arguments:
+          parameters:
+          - name: model-name
+            value: "{{workflow.parameters.model-name}}"
+          - name: input-shape
+            value: "{{workflow.parameters.input-shape}}"
+
+    # Step 4: Validate ONNX model (Quality Gate 2 - Technical Correctness)
+    - - name: validate-onnx
+        template: validate-onnx-step
+        when: "{{steps.promote.outputs.parameters.result}} == passed"
+        arguments:
+          parameters:
+          - name: export-run-id
+            value: "{{steps.export-onnx.outputs.parameters.export-run-id}}"
+
+  # Step Template Definitions
+
+  - name: train-step
+    inputs:
+      parameters:
+      - name: epochs
+      - name: learning-rate
+      - name: batch-size
+    outputs:
+      parameters:
+      - name: run-id
+        valueFrom:
+          path: /tmp/mlflow_run_id
+    # Schedule on gpu-training node group (g4dn.xlarge, ON_DEMAND)
+    nodeSelector:
+      workload: gpu-training
+    tolerations:
+    - key: nvidia.com/gpu
+      value: "true"
+      effect: NoSchedule
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/triton-training-tools:latest
+      imagePullPolicy: Always
+      command: [sh, -c]
+      args:
+      - |
+        ARGS="--config=/scripts/image-classification/config.yaml"
+        if [ -n "{{inputs.parameters.epochs}}" ]; then
+          ARGS="$ARGS --epochs={{inputs.parameters.epochs}}"
+        fi
+        if [ -n "{{inputs.parameters.learning-rate}}" ]; then
+          ARGS="$ARGS --learning-rate={{inputs.parameters.learning-rate}}"
+        fi
+        if [ -n "{{inputs.parameters.batch-size}}" ]; then
+          ARGS="$ARGS --batch-size={{inputs.parameters.batch-size}}"
+        fi
+        python /scripts/image-classification/train.py $ARGS
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: MLFLOW_TRACKING_URI
+        value: "{{workflow.parameters.mlflow-tracking-uri}}"
+      resources:
+        requests:
+          nvidia.com/gpu: 1
+          cpu: "3"
+          memory: "8Gi"
+        limits:
+          nvidia.com/gpu: 1
+          cpu: "4"
+          memory: "14Gi"
+      volumeMounts:
+      - name: dshm
+        mountPath: /dev/shm
+    volumes:
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 4Gi
+
+  - name: promote-step
+    inputs:
+      parameters:
+      - name: run-id
+    outputs:
+      parameters:
+      - name: result
+        valueFrom:
+          path: /tmp/promotion_result
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/triton-training-tools:latest
+      imagePullPolicy: Always
+      command: [sh, -c]
+      args:
+      - |
+        python /scripts/image-classification/promote.py \
+          --run-id={{inputs.parameters.run-id}} 2>&1 | tee /tmp/promote_output.log
+
+        # Capture RESULT from stdout for Argo output parameter
+        grep -oP 'RESULT=\K\w+' /tmp/promote_output.log > /tmp/promotion_result \
+          || echo "failed" > /tmp/promotion_result
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: MLFLOW_TRACKING_URI
+        value: "{{workflow.parameters.mlflow-tracking-uri}}"
+      resources:
+        requests:
+          memory: "512Mi"
+          cpu: "250m"
+        limits:
+          memory: "1Gi"
+          cpu: "500m"
+
+  - name: export-onnx-step
+    inputs:
+      parameters:
+      - name: model-name
+      - name: input-shape
+    outputs:
+      parameters:
+      - name: export-run-id
+        valueFrom:
+          path: /tmp/export_run_id
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/triton-training-tools:latest
+      imagePullPolicy: Always
+      command: [python, /scripts/image-classification/export_to_onnx.py]
+      args:
+      - --model-name={{inputs.parameters.model-name}}
+      - --alias=champion
+      - --input-shape={{inputs.parameters.input-shape}}
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: MLFLOW_TRACKING_URI
+        value: "{{workflow.parameters.mlflow-tracking-uri}}"
+      resources:
+        requests:
+          memory: "2Gi"
+          cpu: "1"
+        limits:
+          memory: "4Gi"
+          cpu: "2"
+
+  - name: validate-onnx-step
+    inputs:
+      parameters:
+      - name: export-run-id
+    container:
+      image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/triton-training-tools:latest
+      imagePullPolicy: Always
+      command: [python, /scripts/image-classification/validate_onnx.py]
+      args:
+      - --export-run-id={{inputs.parameters.export-run-id}}
+      - --num-samples=100
+      env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: MLFLOW_TRACKING_URI
+        value: "{{workflow.parameters.mlflow-tracking-uri}}"
+      resources:
+        requests:
+          memory: "2Gi"
+          cpu: "1"
+        limits:
+          memory: "4Gi"
+          cpu: "2"
