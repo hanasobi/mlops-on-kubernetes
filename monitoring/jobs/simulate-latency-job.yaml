@@ -1,0 +1,69 @@
+# Simulate Latency Spike
+#
+# Floods vLLM with concurrent requests to trigger P95 latency and TTFT alerts.
+# Runs inside the cluster — measures actual vLLM latency, not kubectl tunnel.
+#
+# Usage:
+#   kubectl apply -f monitoring/jobs/scripts-configmap.yaml
+#   kubectl apply -f monitoring/jobs/simulate-latency-job.yaml
+#
+# Override defaults:
+#   kubectl delete job simulate-latency -n ml-models 2>/dev/null
+#   cat monitoring/jobs/simulate-latency-job.yaml | \
+#     sed 's/value: "10"/value: "20"/' | \      # CONCURRENCY
+#     sed 's/value: "120"/value: "180"/' | \     # DURATION
+#     kubectl apply -f -
+#
+# Monitor:
+#   kubectl logs -f job/simulate-latency -n ml-models
+#
+# Cleanup:
+#   kubectl delete job simulate-latency -n ml-models
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: simulate-latency
+  namespace: ml-models
+  labels:
+    app: ml-simulation
+    simulation: latency
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: ml-simulation
+        simulation: latency
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: simulate
+        image: <your-ecr-registry>/vllm-deployment-tools:latest
+        command: ["python", "/scripts/simulate_latency.py"]
+        env:
+        - name: VLLM_URL
+          value: "http://vllm-service:8000"
+        - name: MODEL
+          value: "aws-rag-qa-live"
+        - name: CONCURRENCY
+          value: "50"
+        - name: DURATION
+          value: "180"
+        - name: MAX_TOKENS
+          value: "2048"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+          readOnly: true
+      volumes:
+      - name: scripts
+        configMap:
+          name: simulation-scripts

@@ -1,0 +1,88 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ml-production-alerts
+  namespace: ai-platform
+  labels:
+    app: ml-monitoring
+    # kube-prometheus-stack default ruleSelector picks up rules with this label
+    release: monitoring
+spec:
+  groups:
+  - name: vllm-performance
+    rules:
+    - alert: VllmP95LatencyHigh
+      expr: histogram_quantile(0.95, rate(vllm:e2e_request_latency_seconds_bucket{job="vllm-service"}[5m])) > 8
+      for: 2m
+      labels:
+        severity: critical
+        category: performance
+        service: vllm
+      annotations:
+        summary: "vLLM P95 latency exceeds 8 seconds"
+        description: "P95 end-to-end request latency is {{ $value | humanizeDuration }} (threshold: 8s)."
+        runbook: "Check concurrent request count and KV cache usage. Consider scaling or reducing max_model_len."
+
+    - alert: VllmP95TtftHigh
+      expr: histogram_quantile(0.95, rate(vllm:time_to_first_token_seconds_bucket{job="vllm-service"}[5m])) > 2
+      for: 2m
+      labels:
+        severity: warning
+        category: performance
+        service: vllm
+      annotations:
+        summary: "vLLM P95 time-to-first-token exceeds 2 seconds"
+        description: "P95 TTFT is {{ $value | humanizeDuration }} (threshold: 2s)."
+        runbook: "High TTFT indicates prompt processing bottleneck. Check queue length and GPU utilization."
+
+  - name: vllm-infrastructure
+    rules:
+    - alert: VllmKvCacheSaturated
+      expr: vllm:kv_cache_usage_perc{job="vllm-service"} > 0.9
+      for: 5m
+      labels:
+        severity: warning
+        category: infrastructure
+        service: vllm
+      annotations:
+        summary: "vLLM KV cache usage exceeds 90%"
+        description: "KV cache is at {{ $value | humanizePercentage }}. New requests may be queued or rejected."
+        runbook: "Reduce concurrent long-context requests, lower max_model_len, or increase gpu-memory-utilization."
+
+    - alert: VllmRequestErrors
+      expr: rate(vllm:request_failure_total{job="vllm-service"}[5m]) > 0
+      for: 2m
+      labels:
+        severity: critical
+        category: infrastructure
+        service: vllm
+      annotations:
+        summary: "vLLM is returning request failures"
+        description: "Failure rate: {{ $value | humanize }} req/s over the last 5 minutes."
+        runbook: "Check vLLM pod logs for OOM errors, CUDA errors, or adapter loading failures."
+
+  - name: triton-alerts
+    rules:
+    - alert: TritonInferenceErrors
+      expr: rate(nv_inference_request_failure[5m]) > 0
+      for: 2m
+      labels:
+        severity: critical
+        category: infrastructure
+        service: triton
+      annotations:
+        summary: "Triton is returning inference failures"
+        description: "Failure rate: {{ $value | humanize }} req/s over the last 5 minutes."
+        runbook: "Check Triton logs. Common causes: model not loaded, input shape mismatch, OOM."
+
+    - alert: TritonQueueSaturation
+      expr: (rate(nv_inference_queue_duration_us[5m]) / rate(nv_inference_request_success[5m])) / 1e6 > 1
+      for: 3m
+      labels:
+        severity: warning
+        category: performance
+        service: triton
+      annotations:
+        summary: "Triton average queue wait exceeds 1 second"
+        description: "Average queue duration: {{ $value | humanizeDuration }}."
+        runbook: "Check model instance count and batch size configuration. Consider adding model replicas."

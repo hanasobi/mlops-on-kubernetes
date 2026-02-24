@@ -1,0 +1,162 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: simulation-scripts
+  namespace: ml-models
+data:
+  simulate_latency.py: |
+    #!/usr/bin/env python3
+    """Simulate latency spike by flooding vLLM with concurrent requests."""
+    import os
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import requests
+
+    VLLM_URL = os.environ.get("VLLM_URL", "http://vllm-service:8000")
+    MODEL = os.environ.get("MODEL", "aws-rag-qa-live")
+    CONCURRENCY = int(os.environ.get("CONCURRENCY", "10"))
+    DURATION = int(os.environ.get("DURATION", "120"))
+    MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "512"))
+
+    PROMPTS = [
+        "Explain in great detail how Amazon EKS manages the Kubernetes control plane, including the architecture of etcd clusters, API server high availability, and how upgrades are performed across multiple availability zones. Cover the networking aspects including VPC CNI plugin, pod networking, and service discovery mechanisms.",
+        "Write a comprehensive guide on implementing a multi-region disaster recovery strategy using AWS services. Include detailed steps for RDS cross-region read replicas, S3 cross-region replication, Route 53 failover routing, and CloudFormation StackSets. Provide example configurations and explain RPO/RTO tradeoffs.",
+        "Describe the complete lifecycle of an HTTP request through an AWS Application Load Balancer, including TLS termination, target group health checks, connection draining, sticky sessions, and how WAF rules are evaluated. Include details about access logging and CloudWatch metrics integration.",
+        "Explain how AWS Lambda cold starts work at a deep technical level, including the microVM architecture with Firecracker, execution environment reuse, provisioned concurrency implementation, and memory allocation strategies. Discuss how different runtimes affect cold start performance.",
+        "Provide a detailed analysis of Amazon DynamoDB's internal architecture, including the partition management system, consistent hashing, Paxos-based replication, adaptive capacity, and how global secondary indexes maintain eventual consistency. Cover the request router and storage node interactions.",
+    ]
+
+    def fire_request(prompt):
+        payload = {"model": MODEL, "prompt": prompt, "max_tokens": MAX_TOKENS, "temperature": 0.7}
+        start = time.time()
+        try:
+            resp = requests.post(f"{VLLM_URL.rstrip('/')}/v1/completions", json=payload, timeout=120)
+            resp.raise_for_status()
+            return {"success": True, "latency": round(time.time() - start, 2)}
+        except Exception as e:
+            return {"success": False, "latency": round(time.time() - start, 2), "error": str(e)}
+
+    def main():
+        print(f"Simulating latency spike on {VLLM_URL}")
+        print(f"  Model:       {MODEL}")
+        print(f"  Concurrency: {CONCURRENCY}")
+        print(f"  Duration:    {DURATION}s")
+        print(f"  Max tokens:  {MAX_TOKENS}")
+        print()
+
+        end_time = time.time() + DURATION
+        total, success, errors = 0, 0, 0
+        idx = 0
+
+        with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+            futures = {}
+            while time.time() < end_time:
+                while len(futures) < CONCURRENCY and time.time() < end_time:
+                    prompt = PROMPTS[idx % len(PROMPTS)]
+                    idx += 1
+                    futures[pool.submit(fire_request, prompt)] = True
+                done = [f for f in futures if f.done()]
+                for f in done:
+                    result = f.result()
+                    total += 1
+                    if result["success"]:
+                        success += 1
+                    else:
+                        errors += 1
+                        print(f"  Error: {result.get('error', 'unknown')}")
+                    del futures[f]
+                time.sleep(0.1)
+            for f in as_completed(futures):
+                result = f.result()
+                total += 1
+                if result["success"]:
+                    success += 1
+                else:
+                    errors += 1
+
+        print(f"\nResults ({DURATION}s):")
+        print(f"  Total requests: {total}")
+        print(f"  Success:        {success}")
+        print(f"  Errors:         {errors}")
+        print(f"  Throughput:     {total / DURATION:.2f} req/s")
+        print(f"\nCheck Grafana for P95 latency and TTFT spikes.")
+
+    if __name__ == "__main__":
+        main()
+
+  simulate_kv_cache.py: |
+    #!/usr/bin/env python3
+    """Simulate KV cache saturation by sending long-context requests."""
+    import os
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import requests
+
+    VLLM_URL = os.environ.get("VLLM_URL", "http://vllm-service:8000")
+    MODEL = os.environ.get("MODEL", "aws-rag-qa-live")
+    NUM_REQUESTS = int(os.environ.get("NUM_REQUESTS", "10"))
+    CONTEXT_TOKENS = int(os.environ.get("CONTEXT_TOKENS", "3000"))
+    CONCURRENCY = int(os.environ.get("CONCURRENCY", "5"))
+
+    FILLER_BLOCK = (
+        "Amazon Web Services provides a broad set of global cloud-based products "
+        "including compute, storage, databases, analytics, networking, mobile, "
+        "developer tools, management tools, IoT, security, and enterprise "
+        "applications on demand, available in seconds, with pay-as-you-go pricing. "
+    )
+
+    def build_long_prompt(target_tokens):
+        repetitions = max(1, target_tokens // 50)
+        context = FILLER_BLOCK * repetitions
+        return f"Based on the following context, provide a detailed summary:\n\n{context}\n\nSummarize the key points above in detail."
+
+    def fire_request(prompt):
+        payload = {"model": MODEL, "prompt": prompt, "max_tokens": 256, "temperature": 0.0}
+        start = time.time()
+        try:
+            resp = requests.post(f"{VLLM_URL.rstrip('/')}/v1/completions", json=payload, timeout=180)
+            resp.raise_for_status()
+            elapsed = time.time() - start
+            usage = resp.json().get("usage", {})
+            return {
+                "success": True, "latency": round(elapsed, 2),
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+            }
+        except Exception as e:
+            return {"success": False, "latency": round(time.time() - start, 2), "error": str(e)}
+
+    def main():
+        print(f"Simulating KV cache saturation on {VLLM_URL}")
+        print(f"  Model:          {MODEL}")
+        print(f"  Requests:       {NUM_REQUESTS}")
+        print(f"  Context tokens: ~{CONTEXT_TOKENS}")
+        print(f"  Concurrency:    {CONCURRENCY}")
+        print()
+
+        prompt = build_long_prompt(CONTEXT_TOKENS)
+        success, errors = 0, 0
+
+        with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+            futures = [pool.submit(fire_request, prompt) for _ in range(NUM_REQUESTS)]
+            for i, future in enumerate(as_completed(futures), 1):
+                result = future.result()
+                if result["success"]:
+                    success += 1
+                    print(
+                        f"  [{i}/{NUM_REQUESTS}] OK "
+                        f"({result['latency']}s, "
+                        f"{result['prompt_tokens']} prompt tokens, "
+                        f"{result['completion_tokens']} completion tokens)"
+                    )
+                else:
+                    errors += 1
+                    print(f"  [{i}/{NUM_REQUESTS}] FAIL ({result['latency']}s: {result.get('error', 'unknown')})")
+
+        print(f"\nResults:")
+        print(f"  Success: {success}")
+        print(f"  Errors:  {errors}")
+        print(f"\nCheck Grafana for KV cache usage spike (> 90% triggers alert).")
+
+    if __name__ == "__main__":
+        main()

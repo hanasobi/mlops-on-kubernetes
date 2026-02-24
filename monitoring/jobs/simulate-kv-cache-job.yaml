@@ -1,0 +1,70 @@
+# Simulate KV Cache Saturation
+#
+# Sends long-context requests to fill the vLLM KV cache (max_model_len=4096).
+# Runs inside the cluster — measures actual vLLM latency, not kubectl tunnel.
+#
+# Usage:
+#   kubectl apply -f monitoring/jobs/scripts-configmap.yaml
+#   kubectl apply -f monitoring/jobs/simulate-kv-cache-job.yaml
+#
+# More aggressive:
+#   kubectl delete job simulate-kv-cache -n ml-models 2>/dev/null
+#   cat monitoring/jobs/simulate-kv-cache-job.yaml | \
+#     sed 's/value: "10"/value: "20"/' | \          # NUM_REQUESTS
+#     sed 's/value: "3000"/value: "3500"/' | \      # CONTEXT_TOKENS
+#     sed 's/value: "5"/value: "8"/' | \            # CONCURRENCY
+#     kubectl apply -f -
+#
+# Monitor:
+#   kubectl logs -f job/simulate-kv-cache -n ml-models
+#
+# Cleanup:
+#   kubectl delete job simulate-kv-cache -n ml-models
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: simulate-kv-cache
+  namespace: ml-models
+  labels:
+    app: ml-simulation
+    simulation: kv-cache
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: ml-simulation
+        simulation: kv-cache
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: simulate
+        image: <your-ecr-registry>/vllm-deployment-tools:latest
+        command: ["python", "/scripts/simulate_kv_cache.py"]
+        env:
+        - name: VLLM_URL
+          value: "http://vllm-service:8000"
+        - name: MODEL
+          value: "aws-rag-qa-live"
+        - name: NUM_REQUESTS
+          value: "10"
+        - name: CONTEXT_TOKENS
+          value: "3000"
+        - name: CONCURRENCY
+          value: "5"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+          readOnly: true
+      volumes:
+      - name: scripts
+        configMap:
+          name: simulation-scripts

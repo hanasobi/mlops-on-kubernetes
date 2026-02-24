@@ -154,11 +154,22 @@ mlops-on-kubernetes/
 │   ├── triton/
 │   └── vllm/
 │
+├── monitoring/                 # Production monitoring and alerting
+│   ├── scripts/
+│   │   ├── simulate_latency.py   # Trigger latency alerts (load test)
+│   │   └── simulate_kv_cache.py  # Trigger KV cache alerts (long context)
+│   ├── jobs/                     # K8s Jobs for in-cluster simulation
+│   └── README.md
+│
 └── infra/                      # Kubernetes manifests and GitOps configs
     ├── argocd/
+    │   ├── monitoring/         #   Grafana dashboards + alert rules
     │   ├── triton/
     │   └── vllm/
     └── k8s/
+        ├── monitoring/
+        │   ├── alerts/         #   PrometheusRule CRD
+        │   └── grafana/        #   Dashboard ConfigMaps (sidecar provisioning)
         ├── triton/             #   Kustomize base + overlays (cpu/gpu)
         ├── vllm/               #   Deployment, init-container, ConfigMap
         └── shared/             #   ServiceAccount, RBAC for Argo Workflows
@@ -177,7 +188,7 @@ Training and deployment scripts are separated into different directories (and di
 
 ## Container Images
 
-GitHub Actions build container images for each pipeline, pushed to ECR (`123456789012.dkr.ecr.eu-central-1.amazonaws.com`):
+GitHub Actions build container images for each pipeline, pushed to ECR (`<your-ecr-registry>`):
 
 | Image | Contents | Used by |
 |-------|----------|---------|
@@ -189,8 +200,9 @@ GitHub Actions build container images for each pipeline, pushed to ECR (`1234567
 ## Roadmap
 
 - **~~End-to-end workflow (Triton):~~** Training → Deployment chained via WorkflowTemplates with conditional gate _(done)_
+- **~~Grafana alerts:~~** Production dashboards and alerting for performance (P95 latency, TTFT) and infrastructure (KV cache, GPU, errors) with Slack notifications _(done)_
 - **End-to-end workflow (vLLM):** Chain training, deployment, evaluation, performance, and promote into a single Argo workflow with conditional gates
-- **Grafana alerts:** Production alerting for performance regression, model drift, and resource saturation
+- **Application-level monitoring (Loki):** Structured logging for refusal rate, coverage gaps, and response quality — bridging the gap between service metrics and application semantics
 - **Canary deployment:** Gradual traffic shifting with Argo Rollouts instead of instant adapter swap
 
 ## Related
