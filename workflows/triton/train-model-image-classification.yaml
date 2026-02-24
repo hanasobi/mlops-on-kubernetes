@@ -1,7 +1,7 @@
 apiVersion: argoproj.io/v1alpha1
-kind: Workflow
+kind: WorkflowTemplate
 metadata:
-  generateName: train-resnet18-
+  name: triton-training-pipeline
   namespace: ml-models
   labels:
     workflows.argoproj.io/workflow-type: training
@@ -40,24 +40,47 @@ spec:
 
   templates:
   - name: training-pipeline
+    inputs:
+      parameters:
+      - name: model-name
+        default: "{{workflow.parameters.model-name}}"
+      - name: mlflow-tracking-uri
+        default: "{{workflow.parameters.mlflow-tracking-uri}}"
+      - name: input-shape
+        default: "{{workflow.parameters.input-shape}}"
+      - name: epochs
+        default: "{{workflow.parameters.epochs}}"
+      - name: learning-rate
+        default: "{{workflow.parameters.learning-rate}}"
+      - name: batch-size
+        default: "{{workflow.parameters.batch-size}}"
+    outputs:
+      parameters:
+      - name: promotion-result
+        valueFrom:
+          parameter: "{{steps.promote.outputs.parameters.result}}"
     steps:
     # Step 1: Train model on ImageNette
     - - name: train
         template: train-step
         arguments:
           parameters:
+          - name: mlflow-tracking-uri
+            value: "{{inputs.parameters.mlflow-tracking-uri}}"
           - name: epochs
-            value: "{{workflow.parameters.epochs}}"
+            value: "{{inputs.parameters.epochs}}"
           - name: learning-rate
-            value: "{{workflow.parameters.learning-rate}}"
+            value: "{{inputs.parameters.learning-rate}}"
           - name: batch-size
-            value: "{{workflow.parameters.batch-size}}"
+            value: "{{inputs.parameters.batch-size}}"
 
     # Step 2: Promote model (Quality Gate 1 - Training Performance)
     - - name: promote
         template: promote-step
         arguments:
           parameters:
+          - name: mlflow-tracking-uri
+            value: "{{inputs.parameters.mlflow-tracking-uri}}"
           - name: run-id
             value: "{{steps.train.outputs.parameters.run-id}}"
 
@@ -67,10 +90,12 @@ spec:
         when: "{{steps.promote.outputs.parameters.result}} == passed"
         arguments:
           parameters:
+          - name: mlflow-tracking-uri
+            value: "{{inputs.parameters.mlflow-tracking-uri}}"
           - name: model-name
-            value: "{{workflow.parameters.model-name}}"
+            value: "{{inputs.parameters.model-name}}"
           - name: input-shape
-            value: "{{workflow.parameters.input-shape}}"
+            value: "{{inputs.parameters.input-shape}}"
 
     # Step 4: Validate ONNX model (Quality Gate 2 - Technical Correctness)
     - - name: validate-onnx
@@ -78,6 +103,8 @@ spec:
         when: "{{steps.promote.outputs.parameters.result}} == passed"
         arguments:
           parameters:
+          - name: mlflow-tracking-uri
+            value: "{{inputs.parameters.mlflow-tracking-uri}}"
           - name: export-run-id
             value: "{{steps.export-onnx.outputs.parameters.export-run-id}}"
 
@@ -86,6 +113,7 @@ spec:
   - name: train-step
     inputs:
       parameters:
+      - name: mlflow-tracking-uri
       - name: epochs
       - name: learning-rate
       - name: batch-size
@@ -122,7 +150,7 @@ spec:
       - name: PYTHONUNBUFFERED
         value: "1"
       - name: MLFLOW_TRACKING_URI
-        value: "{{workflow.parameters.mlflow-tracking-uri}}"
+        value: "{{inputs.parameters.mlflow-tracking-uri}}"
       resources:
         requests:
           nvidia.com/gpu: 1
@@ -144,6 +172,7 @@ spec:
   - name: promote-step
     inputs:
       parameters:
+      - name: mlflow-tracking-uri
       - name: run-id
     outputs:
       parameters:
@@ -166,7 +195,7 @@ spec:
       - name: PYTHONUNBUFFERED
         value: "1"
       - name: MLFLOW_TRACKING_URI
-        value: "{{workflow.parameters.mlflow-tracking-uri}}"
+        value: "{{inputs.parameters.mlflow-tracking-uri}}"
       resources:
         requests:
           memory: "512Mi"
@@ -178,6 +207,7 @@ spec:
   - name: export-onnx-step
     inputs:
       parameters:
+      - name: mlflow-tracking-uri
       - name: model-name
       - name: input-shape
     outputs:
@@ -197,7 +227,7 @@ spec:
       - name: PYTHONUNBUFFERED
         value: "1"
       - name: MLFLOW_TRACKING_URI
-        value: "{{workflow.parameters.mlflow-tracking-uri}}"
+        value: "{{inputs.parameters.mlflow-tracking-uri}}"
       resources:
         requests:
           memory: "2Gi"
@@ -209,6 +239,7 @@ spec:
   - name: validate-onnx-step
     inputs:
       parameters:
+      - name: mlflow-tracking-uri
       - name: export-run-id
     container:
       image: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/triton-training-tools:latest
@@ -221,7 +252,7 @@ spec:
       - name: PYTHONUNBUFFERED
         value: "1"
       - name: MLFLOW_TRACKING_URI
-        value: "{{workflow.parameters.mlflow-tracking-uri}}"
+        value: "{{inputs.parameters.mlflow-tracking-uri}}"
       resources:
         requests:
           memory: "2Gi"

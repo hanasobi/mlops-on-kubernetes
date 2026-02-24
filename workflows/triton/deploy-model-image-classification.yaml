@@ -1,7 +1,7 @@
 apiVersion: argoproj.io/v1alpha1
-kind: Workflow
+kind: WorkflowTemplate
 metadata:
-  generateName: deploy-resnet18-
+  name: triton-deployment-pipeline
   namespace: ml-models
   labels:
     workflows.argoproj.io/workflow-type: deployment
@@ -49,6 +49,24 @@ spec:
   
   templates:
   - name: deploy-pipeline
+    inputs:
+      parameters:
+      - name: model-name
+        default: "{{workflow.parameters.model-name}}"
+      - name: source
+        default: "{{workflow.parameters.source}}"
+      - name: force-version
+        default: "{{workflow.parameters.force-version}}"
+      - name: mlflow-tracking-uri
+        default: "{{workflow.parameters.mlflow-tracking-uri}}"
+      - name: s3-bucket
+        default: "{{workflow.parameters.s3-bucket}}"
+      - name: triton-url
+        default: "{{workflow.parameters.triton-url}}"
+      - name: expected-input-shape
+        default: "{{workflow.parameters.expected-input-shape}}"
+      - name: expected-output-shape
+        default: "{{workflow.parameters.expected-output-shape}}"
     steps:
     # Step 1: Fetch Model from MLflow
     - - name: fetch-model
@@ -56,31 +74,31 @@ spec:
         arguments:
           parameters:
           - name: model-name
-            value: "{{workflow.parameters.model-name}}"
+            value: "{{inputs.parameters.model-name}}"
           - name: source
-            value: "{{workflow.parameters.source}}"
+            value: "{{inputs.parameters.source}}"
           - name: mlflow-tracking-uri
-            value: "{{workflow.parameters.mlflow-tracking-uri}}"
-    
+            value: "{{inputs.parameters.mlflow-tracking-uri}}"
+
     # Step 2: Determine Next Triton Version
     - - name: determine-version
         template: determine-version-step
         arguments:
           parameters:
           - name: model-name
-            value: "{{workflow.parameters.model-name}}"
+            value: "{{inputs.parameters.model-name}}"
           - name: s3-bucket
-            value: "{{workflow.parameters.s3-bucket}}"
+            value: "{{inputs.parameters.s3-bucket}}"
           - name: force-version
-            value: "{{workflow.parameters.force-version}}"
-    
+            value: "{{inputs.parameters.force-version}}"
+
     # Step 3: Prepare Deployment Artifacts
     - - name: prepare-artifacts
         template: prepare-artifacts-step
         arguments:
           parameters:
           - name: model-name
-            value: "{{workflow.parameters.model-name}}"
+            value: "{{inputs.parameters.model-name}}"
           artifacts:
           - name: mlflow-metadata
             from: "{{steps.fetch-model.outputs.artifacts.mlflow-metadata}}"
@@ -88,60 +106,60 @@ spec:
             from: "{{steps.fetch-model.outputs.artifacts.model-file}}"
           - name: triton-version
             from: "{{steps.determine-version.outputs.artifacts.triton-version}}"
-    
+
     # Step 4: Upload to S3
     - - name: upload-to-s3
         template: upload-to-s3-step
         arguments:
           parameters:
           - name: model-name
-            value: "{{workflow.parameters.model-name}}"
+            value: "{{inputs.parameters.model-name}}"
           - name: s3-bucket
-            value: "{{workflow.parameters.s3-bucket}}"
+            value: "{{inputs.parameters.s3-bucket}}"
           artifacts:
           - name: triton-version
             from: "{{steps.determine-version.outputs.artifacts.triton-version}}"
           - name: artifacts
             from: "{{steps.prepare-artifacts.outputs.artifacts.deployment-artifacts}}"
-    
+
     # Step 5: Reload Triton
     - - name: reload-triton
         template: reload-triton-step
         arguments:
           parameters:
           - name: model-name
-            value: "{{workflow.parameters.model-name}}"
+            value: "{{inputs.parameters.model-name}}"
           - name: triton-url
-            value: "{{workflow.parameters.triton-url}}"
+            value: "{{inputs.parameters.triton-url}}"
           artifacts:
           - name: triton-version
             from: "{{steps.determine-version.outputs.artifacts.triton-version}}"
-    
+
     # Steps 6 & 7: Update Aliases and Verify Deployment (PARALLEL)
     - - name: update-aliases
         template: update-aliases-step
         arguments:
           parameters:
           - name: model-name
-            value: "{{workflow.parameters.model-name}}"
+            value: "{{inputs.parameters.model-name}}"
           - name: mlflow-tracking-uri
-            value: "{{workflow.parameters.mlflow-tracking-uri}}"
+            value: "{{inputs.parameters.mlflow-tracking-uri}}"
           artifacts:
           - name: metadata
             from: "{{steps.prepare-artifacts.outputs.artifacts.metadata}}"
-      
+
       - name: verify-deployment
         template: verify-deployment-step
         arguments:
           parameters:
           - name: model-name
-            value: "{{workflow.parameters.model-name}}"
+            value: "{{inputs.parameters.model-name}}"
           - name: triton-url
-            value: "{{workflow.parameters.triton-url}}"
+            value: "{{inputs.parameters.triton-url}}"
           - name: expected-input-shape
-            value: "{{workflow.parameters.expected-input-shape}}"
+            value: "{{inputs.parameters.expected-input-shape}}"
           - name: expected-output-shape
-            value: "{{workflow.parameters.expected-output-shape}}"
+            value: "{{inputs.parameters.expected-output-shape}}"
   
   # Step Template Definitions
   

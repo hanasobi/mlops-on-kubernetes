@@ -1,0 +1,120 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: e2e-triton-resnet18-
+  namespace: ml-models
+  labels:
+    workflows.argoproj.io/workflow-type: end-to-end
+    model: resnet18-imagenette
+spec:
+  # Service Account with IRSA annotation for AWS S3 access
+  serviceAccountName: workflow-sa
+
+  # Entry Point
+  entrypoint: end-to-end-pipeline
+
+  # Workflow-wide parameters
+  arguments:
+    parameters:
+    # --- Training parameters ---
+
+    # PyTorch model name (as in MLflow Registry)
+    - name: training-model-name
+      value: "resnet18-imagenette"
+
+    # MLflow Tracking Server URL (shared between training and deployment)
+    - name: mlflow-tracking-uri
+      value: "http://mlflow.ai-platform:80"
+
+    # Input shape for ONNX export (comma-separated)
+    - name: input-shape
+      value: "1,3,224,224"
+
+    # Training hyperparameter overrides (empty = use config.yaml defaults)
+    - name: epochs
+      value: ""
+
+    - name: learning-rate
+      value: ""
+
+    - name: batch-size
+      value: ""
+
+    # --- Deployment parameters ---
+
+    # ONNX model name (as in MLflow Registry)
+    - name: deployment-model-name
+      value: "resnet18-imagenette-onnx"
+
+    # Source for the model - "alias:deploy" or "version:N"
+    - name: source
+      value: "alias:deploy"
+
+    # Optional: Force a specific Triton version
+    - name: force-version
+      value: ""
+
+    # S3 Bucket for Triton Model Repository
+    - name: s3-bucket
+      value: "my-triton-models"
+
+    # Triton Service URL
+    - name: triton-url
+      value: "http://triton-inference.ml-models:8000"
+
+    # Expected Model Shapes (for verification)
+    - name: expected-input-shape
+      value: "[1, 3, 224, 224]"
+
+    - name: expected-output-shape
+      value: "[1, 10]"
+
+  templates:
+  - name: end-to-end-pipeline
+    steps:
+    # Phase 1: Training Pipeline
+    # Trains ResNet18, promotes if quality gate passes, exports to ONNX, validates
+    - - name: training
+        templateRef:
+          name: triton-training-pipeline
+          template: training-pipeline
+        arguments:
+          parameters:
+          - name: model-name
+            value: "{{workflow.parameters.training-model-name}}"
+          - name: mlflow-tracking-uri
+            value: "{{workflow.parameters.mlflow-tracking-uri}}"
+          - name: input-shape
+            value: "{{workflow.parameters.input-shape}}"
+          - name: epochs
+            value: "{{workflow.parameters.epochs}}"
+          - name: learning-rate
+            value: "{{workflow.parameters.learning-rate}}"
+          - name: batch-size
+            value: "{{workflow.parameters.batch-size}}"
+
+    # Phase 2: Deployment Pipeline (only if training quality gate passed)
+    # Fetches ONNX model, uploads to S3, reloads Triton, verifies deployment
+    - - name: deployment
+        templateRef:
+          name: triton-deployment-pipeline
+          template: deploy-pipeline
+        when: "{{steps.training.outputs.parameters.promotion-result}} == passed"
+        arguments:
+          parameters:
+          - name: model-name
+            value: "{{workflow.parameters.deployment-model-name}}"
+          - name: source
+            value: "{{workflow.parameters.source}}"
+          - name: force-version
+            value: "{{workflow.parameters.force-version}}"
+          - name: mlflow-tracking-uri
+            value: "{{workflow.parameters.mlflow-tracking-uri}}"
+          - name: s3-bucket
+            value: "{{workflow.parameters.s3-bucket}}"
+          - name: triton-url
+            value: "{{workflow.parameters.triton-url}}"
+          - name: expected-input-shape
+            value: "{{workflow.parameters.expected-input-shape}}"
+          - name: expected-output-shape
+            value: "{{workflow.parameters.expected-output-shape}}"

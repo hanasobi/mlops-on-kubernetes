@@ -1,38 +1,39 @@
 # Triton Argo Workflows
 
-Argo Workflows for the Triton Inference Server ML pipeline. The pipeline is split into two independent workflows: **Training** (model creation) and **Deployment** (model serving).
+Argo Workflows for the Triton Inference Server ML pipeline. Both workflows are implemented as **WorkflowTemplates** — they can run independently or be chained via the **End-to-End Workflow**.
 
 ## Overview
 
 ```
-Training Workflow                          Deployment Workflow
-==================                         ===================
+End-to-End Workflow
+===================
 
-train (GPU)                                fetch-model
-    |                                          |
-    v                                          v
-promote (Gate 1)                           determine-version
-    |                                          |
-    | RESULT=passed?                           v
-    |   no --> STOP                        prepare-artifacts
-    |   yes                                    |
-    v                                          v
-export-onnx                                upload-to-s3
-    |                                          |
-    v                                          v
-validate-onnx (Gate 2)                     reload-triton
-                                               |
-                                               v
-                                        update-aliases + verify-deployment
+training (WorkflowTemplate: triton-training-pipeline)
+    |
+    | train (GPU) → promote (Gate 1) → export-onnx → validate-onnx (Gate 2)
+    |
+    v
+promotion-result == passed?
+    |   no --> STOP (workflow succeeds, deployment skipped)
+    |   yes
+    v
+deployment (WorkflowTemplate: triton-deployment-pipeline)
+    |
+    | fetch-model → determine-version → prepare-artifacts
+    | → upload-to-s3 → reload-triton → update-aliases + verify
+    |
+    v
+DONE
 ```
 
-The two workflows are connected through **MLflow Model Registry**:
+The two pipelines are connected through **MLflow Model Registry**:
 - Training sets the `deploy` alias on a validated ONNX model
 - Deployment reads the model with `alias:deploy`
+- The end-to-end workflow uses the promotion gate result to decide whether to deploy
 
 ## Training Workflow
 
-**File:** `train-model-image-classification.yaml`
+**File:** `train-model-image-classification.yaml` (WorkflowTemplate: `triton-training-pipeline`)
 
 **Purpose:** Train a ResNet18 model on ImageNette, promote if it beats the current champion, export to ONNX, and validate the export.
 
@@ -102,10 +103,10 @@ The export run logs validation metrics from Gate 2: `validation_max_diff` and `v
 
 ```bash
 # Default training run
-argo submit train-model-image-classification.yaml
+argo submit --from workflowtemplate/triton-training-pipeline -n ml-models
 
 # Override hyperparameters
-argo submit train-model-image-classification.yaml \
+argo submit --from workflowtemplate/triton-training-pipeline -n ml-models \
   -p epochs=20 \
   -p learning-rate=0.0005 \
   -p batch-size=32
@@ -113,7 +114,7 @@ argo submit train-model-image-classification.yaml \
 
 ## Deployment Workflow
 
-**File:** `deploy-model-image-classification.yaml`
+**File:** `deploy-model-image-classification.yaml` (WorkflowTemplate: `triton-deployment-pipeline`)
 
 **Purpose:** Deploy a validated ONNX model from MLflow to Triton Inference Server via S3.
 
@@ -199,11 +200,92 @@ Each deployment produces a `metadata.json` that is stored alongside the model in
 
 ```bash
 # Deploy latest model with 'deploy' alias
-argo submit deploy-model-image-classification.yaml
+argo submit --from workflowtemplate/triton-deployment-pipeline -n ml-models
 
 # Deploy a specific version
-argo submit deploy-model-image-classification.yaml \
+argo submit --from workflowtemplate/triton-deployment-pipeline -n ml-models \
   -p source="version:5"
+```
+
+## End-to-End Workflow
+
+**File:** `pipeline-image-classification.yaml`
+
+**Purpose:** Chains training and deployment into a single workflow. Trains the model, evaluates quality gates, and automatically deploys if all gates pass.
+
+### How It Works
+
+The end-to-end workflow calls both WorkflowTemplates sequentially via `templateRef`. The promotion gate result from the training pipeline determines whether deployment runs:
+
+- **Both gates pass** (promotion-result = passed): Training completes, deployment runs automatically
+- **Gate 1 fails** (promotion-result = failed): Training completes, deployment is skipped, workflow succeeds
+- **Any step fails** (exit non-zero): Workflow fails immediately, deployment never runs
+
+If deployment fails after training succeeded, the `deploy` alias remains set in MLflow. The deployment can be retried independently without retraining.
+
+### Completed End-to-End Pipeline
+
+![End-to-End Pipeline](assets/e2e-pipeline-cli-argo.png)
+
+All 11 steps completed successfully in ~30 minutes. The training phase (4 steps) runs first, including GPU training and both quality gates. Once the promotion gate passes, the deployment phase (7 steps) automatically fetches the ONNX model from MLflow, uploads to S3, reloads Triton, and verifies the deployment.
+
+### Quality Gate Decision
+
+![Promote Step Output](assets/e2e-pipeline-cli-promote-step.png)
+
+The promote step evaluates Quality Gate 1: the candidate model must meet the absolute threshold (`best_val_accuracy >= 0.90`) and show minimum improvement over the current champion. On first run (no existing champion), only the absolute threshold is checked. The `RESULT=passed` output triggers the rest of the pipeline.
+
+### MLflow Aliases After Pipeline
+
+![MLflow ONNX Registry](assets/e2e-pipeline-mlflow-final-alias.png)
+
+After a successful end-to-end run, the ONNX Model Registry shows the full alias lifecycle: Version 5 carries both `deploy` (set by training) and `live` (set by deployment). The previous production version (Version 4) is moved to `previous` as a rollback target.
+
+### Gate Failure Path
+
+![Gate Failure — Deployment Skipped](assets/e2e-pipeline-cli-argo-no-promote.png)
+
+When the same model is trained again without improvement, the promotion gate returns `RESULT=failed`. The export-onnx, validate-onnx, and deployment steps are all skipped. The workflow completes with status **Succeeded** — a failed quality gate is not an error, it's the system working as designed.
+
+### Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `training-model-name` | `resnet18-imagenette` | PyTorch model name in MLflow |
+| `deployment-model-name` | `resnet18-imagenette-onnx` | ONNX model name in MLflow |
+| `mlflow-tracking-uri` | `http://mlflow.ai-platform:80` | MLflow server URL |
+| `input-shape` | `1,3,224,224` | Input shape for ONNX export |
+| `epochs` | _(from config.yaml)_ | Override training epochs |
+| `learning-rate` | _(from config.yaml)_ | Override learning rate |
+| `batch-size` | _(from config.yaml)_ | Override batch size |
+| `source` | `alias:deploy` | Model source for deployment |
+| `force-version` | _(empty)_ | Force a specific Triton version |
+| `s3-bucket` | `my-triton-models` | S3 bucket for Triton model repo |
+| `triton-url` | `http://triton-inference.ml-models:8000` | Triton server URL |
+| `expected-input-shape` | `[1, 3, 224, 224]` | For verification step |
+| `expected-output-shape` | `[1, 10]` | For verification step |
+
+### Prerequisites
+
+The WorkflowTemplates must be installed in the cluster before running the end-to-end workflow:
+
+```bash
+argo template create workflows/triton/train-model-image-classification.yaml -n ml-models
+argo template create workflows/triton/deploy-model-image-classification.yaml -n ml-models
+
+# Verify
+argo template list -n ml-models
+```
+
+### Usage
+
+```bash
+# Full end-to-end pipeline
+argo submit workflows/triton/pipeline-image-classification.yaml -n ml-models --watch
+
+# With training overrides
+argo submit workflows/triton/pipeline-image-classification.yaml -n ml-models \
+  -p epochs=20 -p learning-rate=0.0005 --watch
 ```
 
 ## MLflow Alias Strategy
@@ -260,3 +342,4 @@ Both images are built via GitHub Actions and pushed to ECR (`123456789012.dkr.ec
 - MLflow Tracking Server accessible at the configured URI
 - For training: `gpu-training` node group with `nvidia.com/gpu` taint
 - For deployment: Triton Inference Server running with EXPLICIT model control mode
+- For end-to-end: Both WorkflowTemplates installed via `argo template create`

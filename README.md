@@ -140,8 +140,9 @@ mlops-on-kubernetes/
 │
 ├── workflows/                  # Argo Workflow definitions
 │   ├── triton/
-│   │   ├── train-model-image-classification.yaml
-│   │   └── deploy-model-image-classification.yaml
+│   │   ├── train-model-image-classification.yaml    # WorkflowTemplate
+│   │   ├── deploy-model-image-classification.yaml   # WorkflowTemplate
+│   │   └── pipeline-image-classification.yaml   # End-to-end orchestrator
 │   └── vllm/
 │       ├── train-validate-lora.yaml
 │       ├── deploy-lora-adapter.yaml
@@ -187,7 +188,8 @@ GitHub Actions build container images for each pipeline, pushed to ECR (`1234567
 
 ## Roadmap
 
-- **End-to-end workflow:** Chain training, deployment, evaluation, performance, and promote into a single Argo workflow with conditional gates
+- **~~End-to-end workflow (Triton):~~** Training → Deployment chained via WorkflowTemplates with conditional gate _(done)_
+- **End-to-end workflow (vLLM):** Chain training, deployment, evaluation, performance, and promote into a single Argo workflow with conditional gates
 - **Grafana alerts:** Production alerting for performance regression, model drift, and resource saturation
 - **Canary deployment:** Gradual traffic shifting with Argo Rollouts instead of instant adapter swap
 
